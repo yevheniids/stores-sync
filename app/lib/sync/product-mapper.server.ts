@@ -13,7 +13,6 @@ import type { ProductWithRelations } from "~/types";
 import { getProductVariantsBySku, syncStoreLocations, getInventoryLevelsWithQuantities } from "~/lib/shopify/inventory.server";
 import { upsertInventoryLocation, recalculateAggregateInventory } from "~/lib/db/inventory-queries.server";
 import { sessionStorage as storage } from "~/shopify.server";
-import type { GraphQLClient } from "~/shopify.server";
 
 /**
  * Store variant information for mapping
@@ -185,9 +184,7 @@ export async function getAllMappings(
 export async function syncProductCatalog(
   shopDomain: string,
   options?: {
-    /** Pre-authenticated admin GraphQL client from authenticate.admin() */
-    adminGraphQL?: GraphQLClient;
-    /** Raw access token override */
+    /** Raw access token override (e.g. from adminSession.accessToken). Prefer token over request-bound client for serverless. */
     accessToken?: string;
   }
 ): Promise<{
@@ -207,48 +204,39 @@ export async function syncProductCatalog(
       throw new Error(`Store not found: ${shopDomain}`);
     }
 
-    // Resolve GraphQL client and access token
-    // Priority: admin.graphql() > token override > offline session > Store.accessToken
-    let client: GraphQLClient;
+    // Resolve a real access token first. On serverless (e.g. Vercel), request-bound
+    // admin.graphql() can yield 401 or "Missing access token"; using a stored token
+    // with createGraphQLClient is reliable.
     let accessToken: string;
     let tokenSource: string;
 
-    if (options?.adminGraphQL) {
-      // Best path: use the authenticated admin client from the Shopify library
-      // This uses token exchange and is guaranteed to work
-      client = options.adminGraphQL;
-      accessToken = options.accessToken || "managed-by-admin-graphql";
-      tokenSource = "admin_graphql";
-    } else {
-      // Fallback: resolve a raw access token
-      let resolvedToken: string | undefined = options?.accessToken;
-      tokenSource = resolvedToken ? "override" : "";
+    let resolvedToken: string | undefined = options?.accessToken;
+    tokenSource = resolvedToken ? "override" : "";
 
-      if (!resolvedToken) {
-        const sessionId = `offline_${shopDomain}`;
-        const session = await storage.loadSession(sessionId);
-        if (session?.accessToken) {
-          resolvedToken = session.accessToken;
-          tokenSource = "offline_session";
-        }
+    if (!resolvedToken) {
+      const sessionId = `offline_${shopDomain}`;
+      const session = await storage.loadSession(sessionId);
+      if (session?.accessToken) {
+        resolvedToken = session.accessToken;
+        tokenSource = "offline_session";
       }
-
-      if (!resolvedToken && store.accessToken) {
-        resolvedToken = store.accessToken;
-        tokenSource = "store_record";
-      }
-
-      if (!resolvedToken) {
-        throw new Error(
-          `No access token found for store: ${shopDomain}. ` +
-          `The store merchant must open the app at least once to generate a valid token.`
-        );
-      }
-
-      accessToken = resolvedToken;
-      const { createGraphQLClient } = await import("~/shopify.server");
-      client = createGraphQLClient(shopDomain, accessToken);
     }
+
+    if (!resolvedToken && store.accessToken) {
+      resolvedToken = store.accessToken;
+      tokenSource = tokenSource || "store_record";
+    }
+
+    if (!resolvedToken) {
+      throw new Error(
+        `No access token found for store: ${shopDomain}. ` +
+        `The store merchant must open the app at least once to generate a valid token.`
+      );
+    }
+
+    accessToken = resolvedToken;
+    const { createGraphQLClient } = await import("~/shopify.server");
+    const client = createGraphQLClient(shopDomain, accessToken);
 
     logger.info("Starting product catalog sync", {
       shopDomain,
@@ -261,7 +249,7 @@ export async function syncProductCatalog(
     const locationLookup = new Map<string, string>();
     try {
       const storeLocations = await syncStoreLocations(
-        { shop: shopDomain, accessToken, graphqlClient: options?.adminGraphQL },
+        { shop: shopDomain, accessToken },
         store.id
       );
 
@@ -421,7 +409,7 @@ export async function syncProductCatalog(
                 });
                 
                 const levels = await getInventoryLevelsWithQuantities(
-                  { shop: shopDomain, accessToken, graphqlClient: options?.adminGraphQL },
+                  { shop: shopDomain, accessToken },
                   variant.inventoryItem.id
                 );
                 
@@ -453,13 +441,21 @@ export async function syncProductCatalog(
                     try {
                       const { getOrCreateLocation } = await import("~/lib/shopify/inventory.server");
                       const storeLocation = await getOrCreateLocation(
-                        { shop: shopDomain, accessToken, graphqlClient: options?.adminGraphQL },
+                        { shop: shopDomain, accessToken },
                         store.id,
                         locationGid
                       );
-                      storeLocationId = storeLocation.id;
+                      const resolvedId = storeLocation?.id;
+                      if (typeof resolvedId !== "string") {
+                        logger.warn("getOrCreateLocation returned no id, skipping level", {
+                          locationGid,
+                          sku: variant.sku,
+                        });
+                        continue;
+                      }
+                      storeLocationId = resolvedId;
                       // Add to lookup for future iterations
-                      locationLookup.set(locationGid, storeLocationId);
+                      locationLookup.set(locationGid, resolvedId);
                       logger.info("Created/found location during inventory sync", {
                         locationGid,
                         storeLocationId,

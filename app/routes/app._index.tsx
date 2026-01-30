@@ -16,7 +16,7 @@ import {
 } from "@shopify/polaris";
 import { useCallback } from "react";
 import { prisma } from "~/db.server";
-import { authenticate, wrapAdminGraphQL } from "~/shopify.server";
+import { authenticate } from "~/shopify.server";
 import { syncProductCatalog } from "~/lib/sync/product-mapper.server";
 import { SyncStatusCard } from "~/components/dashboard/SyncStatusCard";
 import { SyncHistoryLog } from "~/components/dashboard/SyncHistoryLog";
@@ -58,12 +58,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     for (const store of stores) {
       const startedAt = new Date();
       try {
-        // For the currently authenticated store, use admin.graphql() (Shopify's
-        // recommended approach — handles token exchange automatically).
-        // For other stores, fall back to stored tokens.
+        // Pass current store's token when syncing that store (we just refreshed it above).
+        // All stores use token-based GraphQL client for reliability on serverless (Vercel).
         const isCurrentStore = store.shopDomain === adminSession.shop;
         const stats = await syncProductCatalog(store.shopDomain, {
-          adminGraphQL: isCurrentStore ? wrapAdminGraphQL(admin) : undefined,
           accessToken: isCurrentStore ? adminSession.accessToken : undefined,
         });
         results.push({ shopDomain: store.shopDomain, ...stats, success: true });
