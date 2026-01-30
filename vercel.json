@@ -1,0 +1,5 @@
+{
+  "buildCommand": "prisma generate && npx remix vite:build",
+  "framework": "remix",
+  "installCommand": "npm install"
+}
