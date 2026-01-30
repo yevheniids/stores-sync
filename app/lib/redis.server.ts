@@ -6,9 +6,17 @@
  * - Caching
  * - Rate limiting
  * - Session management
+ *
+ * Lazy-initialized to avoid crashes in serverless environments (e.g. Vercel)
+ * where Redis may not be available.
  */
 
 import Redis, { type RedisOptions } from "ioredis";
+
+/**
+ * Whether Redis is configured (REDIS_URL or REDIS_HOST set)
+ */
+export const isRedisAvailable = !!(process.env.REDIS_URL || process.env.REDIS_HOST);
 
 /**
  * Redis connection configuration
@@ -27,7 +35,6 @@ const redisConfig: RedisOptions = {
   reconnectOnError: (err: Error) => {
     const targetError = "READONLY";
     if (err.message.includes(targetError)) {
-      // Only reconnect when the error contains "READONLY"
       return true;
     }
     return false;
@@ -62,9 +69,23 @@ function createRedisClient(): Redis {
 }
 
 /**
- * Singleton Redis client for general use
+ * Lazy singleton Redis client — only connects when first accessed
  */
-export const redis = createRedisClient();
+let _redis: Redis | null = null;
+
+export function getRedis(): Redis {
+  if (!_redis) {
+    _redis = createRedisClient();
+  }
+  return _redis;
+}
+
+/** @deprecated Use getRedis() for lazy initialization */
+export const redis = new Proxy({} as Redis, {
+  get(_target, prop, receiver) {
+    return Reflect.get(getRedis(), prop, receiver);
+  },
+});
 
 /**
  * Create separate Redis connections for BullMQ
@@ -81,8 +102,11 @@ export function createBullMQConnection(): Redis {
  * Redis health check
  */
 export async function checkRedisHealth(): Promise<boolean> {
+  if (!isRedisAvailable) {
+    return false;
+  }
   try {
-    const result = await redis.ping();
+    const result = await getRedis().ping();
     return result === "PONG";
   } catch (error) {
     console.error("Redis health check failed:", error);
@@ -94,12 +118,10 @@ export async function checkRedisHealth(): Promise<boolean> {
  * Cache helpers
  */
 export const cache = {
-  /**
-   * Get a cached value
-   */
   async get<T>(key: string): Promise<T | null> {
+    if (!isRedisAvailable) return null;
     try {
-      const value = await redis.get(key);
+      const value = await getRedis().get(key);
       return value ? JSON.parse(value) : null;
     } catch (error) {
       console.error(`Cache get error for key ${key}:`, error);
@@ -107,53 +129,45 @@ export const cache = {
     }
   },
 
-  /**
-   * Set a cached value with optional TTL (in seconds)
-   */
   async set<T>(key: string, value: T, ttl?: number): Promise<void> {
+    if (!isRedisAvailable) return;
     try {
       const serialized = JSON.stringify(value);
       if (ttl) {
-        await redis.setex(key, ttl, serialized);
+        await getRedis().setex(key, ttl, serialized);
       } else {
-        await redis.set(key, serialized);
+        await getRedis().set(key, serialized);
       }
     } catch (error) {
       console.error(`Cache set error for key ${key}:`, error);
     }
   },
 
-  /**
-   * Delete a cached value
-   */
   async delete(key: string): Promise<void> {
+    if (!isRedisAvailable) return;
     try {
-      await redis.del(key);
+      await getRedis().del(key);
     } catch (error) {
       console.error(`Cache delete error for key ${key}:`, error);
     }
   },
 
-  /**
-   * Delete multiple keys by pattern
-   */
   async deletePattern(pattern: string): Promise<void> {
+    if (!isRedisAvailable) return;
     try {
-      const keys = await redis.keys(pattern);
+      const keys = await getRedis().keys(pattern);
       if (keys.length > 0) {
-        await redis.del(...keys);
+        await getRedis().del(...keys);
       }
     } catch (error) {
       console.error(`Cache delete pattern error for ${pattern}:`, error);
     }
   },
 
-  /**
-   * Check if key exists
-   */
   async exists(key: string): Promise<boolean> {
+    if (!isRedisAvailable) return false;
     try {
-      const result = await redis.exists(key);
+      const result = await getRedis().exists(key);
       return result === 1;
     } catch (error) {
       console.error(`Cache exists check error for key ${key}:`, error);
@@ -161,24 +175,20 @@ export const cache = {
     }
   },
 
-  /**
-   * Increment a counter
-   */
   async increment(key: string, by: number = 1): Promise<number> {
+    if (!isRedisAvailable) return 0;
     try {
-      return await redis.incrby(key, by);
+      return await getRedis().incrby(key, by);
     } catch (error) {
       console.error(`Cache increment error for key ${key}:`, error);
       return 0;
     }
   },
 
-  /**
-   * Set expiration on a key
-   */
   async expire(key: string, seconds: number): Promise<void> {
+    if (!isRedisAvailable) return;
     try {
-      await redis.expire(key, seconds);
+      await getRedis().expire(key, seconds);
     } catch (error) {
       console.error(`Cache expire error for key ${key}:`, error);
     }
@@ -193,24 +203,20 @@ export async function checkRateLimit(
   limit: number,
   windowSeconds: number
 ): Promise<{ allowed: boolean; remaining: number; resetAt: Date }> {
-  const key = `ratelimit:${identifier}`;
   const now = Date.now();
   const windowMs = windowSeconds * 1000;
 
+  if (!isRedisAvailable) {
+    return { allowed: true, remaining: limit, resetAt: new Date(now + windowMs) };
+  }
+
+  const key = `ratelimit:${identifier}`;
+
   try {
-    // Use Redis transaction for atomic operations
-    const multi = redis.multi();
-
-    // Remove old entries outside the window
+    const multi = getRedis().multi();
     multi.zremrangebyscore(key, 0, now - windowMs);
-
-    // Count requests in the current window
     multi.zcard(key);
-
-    // Add current request
     multi.zadd(key, now, `${now}`);
-
-    // Set expiration
     multi.expire(key, windowSeconds);
 
     const results = await multi.exec();
@@ -227,7 +233,6 @@ export async function checkRateLimit(
     return { allowed, remaining, resetAt };
   } catch (error) {
     console.error("Rate limit check error:", error);
-    // Fail open - allow the request if Redis is down
     return {
       allowed: true,
       remaining: limit,
@@ -250,12 +255,10 @@ export class RedisLock {
     this.ttl = ttlSeconds;
   }
 
-  /**
-   * Acquire the lock
-   */
   async acquire(): Promise<boolean> {
+    if (!isRedisAvailable) return true; // No-op lock when Redis unavailable
     try {
-      const result = await redis.set(
+      const result = await getRedis().set(
         this.key,
         this.value,
         "EX",
@@ -269,12 +272,9 @@ export class RedisLock {
     }
   }
 
-  /**
-   * Release the lock
-   */
   async release(): Promise<void> {
+    if (!isRedisAvailable) return;
     try {
-      // Only delete if we own the lock
       const script = `
         if redis.call("get", KEYS[1]) == ARGV[1] then
           return redis.call("del", KEYS[1])
@@ -282,16 +282,14 @@ export class RedisLock {
           return 0
         end
       `;
-      await redis.eval(script, 1, this.key, this.value);
+      await getRedis().eval(script, 1, this.key, this.value);
     } catch (error) {
       console.error("Lock release error:", error);
     }
   }
 
-  /**
-   * Extend the lock TTL
-   */
   async extend(additionalSeconds: number): Promise<boolean> {
+    if (!isRedisAvailable) return true;
     try {
       const script = `
         if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -300,7 +298,7 @@ export class RedisLock {
           return 0
         end
       `;
-      const result = await redis.eval(
+      const result = await getRedis().eval(
         script,
         1,
         this.key,
@@ -319,8 +317,10 @@ export class RedisLock {
  * Graceful shutdown
  */
 async function disconnectRedis() {
-  await redis.quit();
-  console.log("Redis connection closed");
+  if (_redis) {
+    await _redis.quit();
+    console.log("Redis connection closed");
+  }
 }
 
 process.on("SIGINT", async () => {

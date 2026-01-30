@@ -2,11 +2,14 @@
 
 name = "store-sync-app"
 client_id = "434af3761fcac4bd15068a9ef277abcf"
-application_url = "https://localhost:3000"
+application_url = "https://stores-sync-git-master-yevheniids-projects-12ca0e11.vercel.app"
 embedded = true
 
 [auth]
-redirect_urls = ["https://localhost:3000/auth/callback"]
+redirect_urls = [
+  "https://stores-sync-git-master-yevheniids-projects-12ca0e11.vercel.app/auth/callback",
+  "https://localhost:3000/auth/callback"
+]
 
 [access_scopes]
 scopes = "write_products,read_products,write_inventory,read_inventory,write_orders,read_orders,read_locations"

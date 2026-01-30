@@ -7,10 +7,13 @@
  * - Webhook processing
  * - Batch operations
  * - Conflict resolution
+ *
+ * Lazy-initialized to avoid crashes in serverless environments (e.g. Vercel)
+ * where Redis may not be available.
  */
 
-import { Queue, Worker, QueueEvents, type Job, type JobsOptions } from "bullmq";
-import { createBullMQConnection } from "./redis.server";
+import { Queue, QueueEvents, type Job, type JobsOptions } from "bullmq";
+import { createBullMQConnection, isRedisAvailable } from "./redis.server";
 
 /**
  * Queue names
@@ -29,7 +32,7 @@ export enum QueueName {
  */
 export interface InventorySyncJob {
   productId: string;
-  storeIds?: string[]; // If empty, sync to all stores
+  storeIds?: string[];
   triggeredBy: string;
 }
 
@@ -74,63 +77,72 @@ const defaultJobOptions: JobsOptions = {
     delay: 5000,
   },
   removeOnComplete: {
-    age: 86400, // Keep completed jobs for 24 hours
+    age: 86400,
     count: 1000,
   },
   removeOnFail: {
-    age: 604800, // Keep failed jobs for 7 days
+    age: 604800,
     count: 5000,
   },
 };
 
 /**
- * Create queue connection
+ * Lazy queue factory — only creates the queue when first accessed
  */
-function createQueue<T = any>(name: QueueName): Queue<T> {
-  return new Queue<T>(name, {
-    connection: createBullMQConnection(),
-    defaultJobOptions,
+function lazyQueue<T = any>(name: QueueName): Queue<T> {
+  let _queue: Queue<T> | null = null;
+  return new Proxy({} as Queue<T>, {
+    get(_target, prop, receiver) {
+      if (!_queue) {
+        _queue = new Queue<T>(name, {
+          connection: createBullMQConnection(),
+          defaultJobOptions,
+        });
+      }
+      return Reflect.get(_queue, prop, receiver);
+    },
   });
 }
 
 /**
- * Queue instances
+ * Queue instances (lazy-initialized)
  */
 export const queues = {
-  inventorySync: createQueue<InventorySyncJob>(QueueName.INVENTORY_SYNC),
-  productSync: createQueue<ProductSyncJob>(QueueName.PRODUCT_SYNC),
-  webhookProcessing: createQueue<WebhookProcessingJob>(
-    QueueName.WEBHOOK_PROCESSING
-  ),
-  batchOperations: createQueue<BatchOperationJob>(QueueName.BATCH_OPERATIONS),
-  conflictResolution: createQueue<ConflictResolutionJob>(
-    QueueName.CONFLICT_RESOLUTION
-  ),
-  scheduledSync: createQueue<ScheduledSyncJob>(QueueName.SCHEDULED_SYNC),
+  inventorySync: lazyQueue<InventorySyncJob>(QueueName.INVENTORY_SYNC),
+  productSync: lazyQueue<ProductSyncJob>(QueueName.PRODUCT_SYNC),
+  webhookProcessing: lazyQueue<WebhookProcessingJob>(QueueName.WEBHOOK_PROCESSING),
+  batchOperations: lazyQueue<BatchOperationJob>(QueueName.BATCH_OPERATIONS),
+  conflictResolution: lazyQueue<ConflictResolutionJob>(QueueName.CONFLICT_RESOLUTION),
+  scheduledSync: lazyQueue<ScheduledSyncJob>(QueueName.SCHEDULED_SYNC),
 };
 
 /**
- * Queue Events for monitoring
+ * Lazy queue events factory
+ */
+function lazyQueueEvents(name: QueueName): QueueEvents {
+  let _events: QueueEvents | null = null;
+  return new Proxy({} as QueueEvents, {
+    get(_target, prop, receiver) {
+      if (!_events) {
+        _events = new QueueEvents(name, {
+          connection: createBullMQConnection(),
+        });
+      }
+      return Reflect.get(_events, prop, receiver);
+    },
+  });
+}
+
+/**
+ * Queue Events for monitoring (lazy-initialized)
  */
 export const queueEvents = {
-  inventorySync: new QueueEvents(QueueName.INVENTORY_SYNC, {
-    connection: createBullMQConnection(),
-  }),
-  productSync: new QueueEvents(QueueName.PRODUCT_SYNC, {
-    connection: createBullMQConnection(),
-  }),
-  webhookProcessing: new QueueEvents(QueueName.WEBHOOK_PROCESSING, {
-    connection: createBullMQConnection(),
-  }),
-  batchOperations: new QueueEvents(QueueName.BATCH_OPERATIONS, {
-    connection: createBullMQConnection(),
-  }),
-  conflictResolution: new QueueEvents(QueueName.CONFLICT_RESOLUTION, {
-    connection: createBullMQConnection(),
-  }),
-  scheduledSync: new QueueEvents(QueueName.SCHEDULED_SYNC, {
-    connection: createBullMQConnection(),
-  }),
+  inventorySync: lazyQueueEvents(QueueName.INVENTORY_SYNC),
+  productSync: lazyQueueEvents(QueueName.PRODUCT_SYNC),
+  webhookProcessing: lazyQueueEvents(QueueName.WEBHOOK_PROCESSING),
+  batchOperations: lazyQueueEvents(QueueName.BATCH_OPERATIONS),
+  conflictResolution: lazyQueueEvents(QueueName.CONFLICT_RESOLUTION),
+  scheduledSync: lazyQueueEvents(QueueName.SCHEDULED_SYNC),
 };
 
 /**
@@ -161,7 +173,6 @@ export async function addInventorySyncJob(
     data,
     {
       ...options,
-      // Prevent duplicate jobs for the same product
       jobId: `inventory-sync-${data.productId}-${Date.now()}`,
     }
   );
@@ -198,8 +209,8 @@ export async function addWebhookJob(
     data,
     {
       ...options,
-      priority: 1, // High priority
-      jobId: data.webhookEventId, // Use webhook event ID for idempotency
+      priority: 1,
+      jobId: data.webhookEventId,
     }
   );
 }
@@ -217,7 +228,7 @@ export async function addBatchOperationJob(
     data,
     {
       ...options,
-      priority: 5, // Lower priority than real-time syncs
+      priority: 5,
     }
   );
 }
@@ -249,7 +260,7 @@ export async function addScheduledSyncJob(
     data,
     {
       repeat: {
-        every: intervalMinutes * 60 * 1000, // Convert to milliseconds
+        every: intervalMinutes * 60 * 1000,
       },
       jobId: `scheduled-sync-${data.storeId}`,
     }
@@ -260,6 +271,9 @@ export async function addScheduledSyncJob(
  * Get queue statistics
  */
 export async function getQueueStats(queue: Queue) {
+  if (!isRedisAvailable) {
+    return { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, total: 0 };
+  }
   const [waiting, active, completed, failed, delayed] = await Promise.all([
     queue.getWaitingCount(),
     queue.getActiveCount(),
@@ -282,6 +296,18 @@ export async function getQueueStats(queue: Queue) {
  * Get all queue statistics
  */
 export async function getAllQueueStats() {
+  if (!isRedisAvailable) {
+    const empty = { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, total: 0 };
+    return {
+      inventorySync: empty,
+      productSync: empty,
+      webhookProcessing: empty,
+      batchOperations: empty,
+      conflictResolution: empty,
+      scheduledSync: empty,
+    };
+  }
+
   const stats = await Promise.all([
     getQueueStats(queues.inventorySync),
     getQueueStats(queues.productSync),
@@ -356,6 +382,8 @@ export async function getJob<T>(
  * Graceful shutdown
  */
 export async function shutdownQueues(): Promise<void> {
+  if (!isRedisAvailable) return;
+
   console.log("Shutting down queues...");
 
   await Promise.all([
@@ -379,7 +407,6 @@ export async function shutdownQueues(): Promise<void> {
   console.log("All queues closed");
 }
 
-// Handle process termination
 process.on("SIGINT", async () => {
   await shutdownQueues();
   process.exit(0);
