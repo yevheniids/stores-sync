@@ -20,6 +20,8 @@ import { authenticate } from "~/shopify.server";
 import { syncProductCatalog } from "~/lib/sync/product-mapper.server";
 import { SyncStatusCard } from "~/components/dashboard/SyncStatusCard";
 import { SyncHistoryLog } from "~/components/dashboard/SyncHistoryLog";
+import { isRedisAvailable } from "~/lib/redis.server";
+import { queues } from "~/lib/queue.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session: adminSession, admin } = await authenticate.admin(request);
@@ -52,6 +54,36 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     if (stores.length === 0) {
       return json({ success: false, error: "No active stores found" }, { status: 400 });
+    }
+
+    // When Redis is available, run sync in background so the request returns immediately
+    // and the button re-enables; avoids Vercel 300s timeout and keeps UI responsive.
+    if (isRedisAvailable) {
+      try {
+        await queues.batchOperations.add(
+          "catalog-sync",
+          {
+            operationType: "initial_sync",
+            data: { triggeredBy: "manual", timestamp: new Date().toISOString() },
+          },
+          { jobId: `catalog-sync-${Date.now()}`, attempts: 1 }
+        );
+        return json(
+          {
+            success: true,
+            message:
+              "Sync started in the background. This may take a few minutes. Refresh the page to see progress.",
+            results: [],
+          },
+          { status: 202 }
+        );
+      } catch (err) {
+        console.error("Failed to enqueue catalog sync:", err);
+        return json(
+          { success: false, error: "Failed to start sync. Try again or run sync without Redis." },
+          { status: 500 }
+        );
+      }
     }
 
     const results = [];

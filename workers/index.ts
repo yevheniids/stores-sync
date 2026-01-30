@@ -9,6 +9,7 @@
  */
 
 import { createWebhookProcessorWorker } from "../app/lib/queue/workers/webhook-processor.worker";
+import { createCatalogSyncWorker } from "../app/lib/queue/workers/catalog-sync.worker";
 import { logger } from "../app/lib/logger.server";
 import type { Worker } from "bullmq";
 import http from "http";
@@ -29,9 +30,13 @@ async function startWorkers(): Promise<void> {
     const webhookWorker = createWebhookProcessorWorker();
     workers.push(webhookWorker);
 
+    // Initialize catalog sync worker (processes "catalog-sync" / initial_sync from batch-operations)
+    const catalogSyncWorker = createCatalogSyncWorker();
+    workers.push(catalogSyncWorker);
+
     logger.info("All workers started successfully", {
       workerCount: workers.length,
-      workers: ["webhook-processing"],
+      workers: ["webhook-processing", "catalog-sync (batch-operations)"],
     });
 
     // Display worker status
@@ -52,6 +57,7 @@ function displayWorkerStatus(): void {
   console.log(`Total Workers: ${workers.length}`);
   console.log("\nActive Queues:");
   console.log("  • webhook-processing (concurrency: 5)");
+  console.log("  • batch-operations / catalog-sync (concurrency: 1)");
   console.log("\nPress Ctrl+C to gracefully shutdown");
   console.log("=".repeat(60) + "\n");
 }

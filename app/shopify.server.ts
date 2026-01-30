@@ -191,8 +191,13 @@ export function createGraphQLClient(shop: string, accessToken: string): GraphQLC
       );
 
       if (!response.ok) {
-        const error = new Error(`GraphQL request failed: ${response.statusText}`);
-        (error as any).status = response.status;
+        const status = response.status;
+        const message =
+          status === 401
+            ? `Access token expired or invalid for ${shop}. Open the app from that store in Shopify Admin to re-authenticate.`
+            : `GraphQL request failed: ${response.statusText}`;
+        const error = new Error(message);
+        (error as any).status = status;
         throw error;
       }
 

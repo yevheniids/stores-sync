@@ -294,6 +294,14 @@ export async function getLocationIds(
       return [];
     }
 
+    // 401 Unauthorized: token expired/revoked — don't throw so sync can continue for other stores
+    if (error?.status === 401) {
+      logger.warn("Store token expired or invalid; skipping locations. Open the app from this store to re-authenticate.", {
+        shop: session.shop,
+      });
+      return [];
+    }
+
     logger.error("Failed to get location IDs", error, {
       shop: session.shop,
     });
