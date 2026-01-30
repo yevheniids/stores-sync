@@ -166,9 +166,16 @@ export async function getAdminClient(shop: string) {
 }
 
 /**
- * Helper function to create GraphQL client
+ * Common GraphQL client interface used across the app
  */
-export function createGraphQLClient(shop: string, accessToken: string) {
+export interface GraphQLClient {
+  query: <T = unknown>(query: string, variables?: Record<string, unknown>) => Promise<T>;
+}
+
+/**
+ * Helper function to create GraphQL client using raw fetch + access token
+ */
+export function createGraphQLClient(shop: string, accessToken: string): GraphQLClient {
   return {
     query: async <T = unknown>(query: string, variables?: Record<string, unknown>): Promise<T> => {
       const response = await fetch(
@@ -189,6 +196,29 @@ export function createGraphQLClient(shop: string, accessToken: string) {
         throw error;
       }
 
+      const result = await response.json();
+
+      if (result.errors) {
+        const error = new Error(`GraphQL errors: ${JSON.stringify(result.errors)}`);
+        (error as any).graphqlErrors = result.errors;
+        throw error;
+      }
+
+      return result.data;
+    },
+  };
+}
+
+/**
+ * Wrap the authenticated admin.graphql() from authenticate.admin()
+ * into our standard GraphQLClient interface.
+ * This is the recommended approach for Shopify Remix apps —
+ * it uses the library's built-in token management (token exchange).
+ */
+export function wrapAdminGraphQL(admin: { graphql: Function }): GraphQLClient {
+  return {
+    query: async <T = unknown>(query: string, variables?: Record<string, unknown>): Promise<T> => {
+      const response = await admin.graphql(query, { variables });
       const result = await response.json();
 
       if (result.errors) {

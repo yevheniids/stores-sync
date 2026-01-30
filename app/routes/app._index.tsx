@@ -16,13 +16,13 @@ import {
 } from "@shopify/polaris";
 import { useCallback } from "react";
 import { prisma } from "~/db.server";
-import { authenticate } from "~/shopify.server";
+import { authenticate, wrapAdminGraphQL } from "~/shopify.server";
 import { syncProductCatalog } from "~/lib/sync/product-mapper.server";
 import { SyncStatusCard } from "~/components/dashboard/SyncStatusCard";
 import { SyncHistoryLog } from "~/components/dashboard/SyncHistoryLog";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session: adminSession } = await authenticate.admin(request);
+  const { session: adminSession, admin } = await authenticate.admin(request);
 
   // Refresh Store.accessToken on every authenticated request
   // so the sync engine always has a valid token
@@ -58,12 +58,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     for (const store of stores) {
       const startedAt = new Date();
       try {
-        // Pass the current admin session's token for the matching store
-        const tokenOverride =
-          store.shopDomain === adminSession.shop
-            ? adminSession.accessToken
-            : undefined;
-        const stats = await syncProductCatalog(store.shopDomain, tokenOverride);
+        // For the currently authenticated store, use admin.graphql() (Shopify's
+        // recommended approach — handles token exchange automatically).
+        // For other stores, fall back to stored tokens.
+        const isCurrentStore = store.shopDomain === adminSession.shop;
+        const stats = await syncProductCatalog(store.shopDomain, {
+          adminGraphQL: isCurrentStore ? wrapAdminGraphQL(admin) : undefined,
+          accessToken: isCurrentStore ? adminSession.accessToken : undefined,
+        });
         results.push({ shopDomain: store.shopDomain, ...stats, success: true });
 
         await prisma.syncOperation.create({

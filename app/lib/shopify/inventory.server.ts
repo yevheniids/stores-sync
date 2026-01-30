@@ -9,9 +9,25 @@
  */
 
 import { createGraphQLClient, withRetry } from "~/shopify.server";
+import type { GraphQLClient } from "~/shopify.server";
 import { logger } from "~/lib/logger.server";
 import { gidToId, idToGid } from "~/lib/helpers";
 import { prisma } from "~/db.server";
+
+/**
+ * Session parameter for inventory functions.
+ * Optionally includes a pre-authenticated graphqlClient (from admin.graphql()).
+ * When provided, bypasses createGraphQLClient and uses the library's token management.
+ */
+export type ShopSession = {
+  shop: string;
+  accessToken: string;
+  graphqlClient?: GraphQLClient;
+};
+
+function getClient(session: ShopSession): GraphQLClient {
+  return session.graphqlClient || createGraphQLClient(session.shop, session.accessToken);
+}
 import {
   INVENTORY_LEVELS_QUERY,
   INVENTORY_LEVELS_WITH_QUANTITIES_QUERY,
@@ -35,11 +51,11 @@ import {
  * Get inventory levels for an inventory item
  */
 export async function getInventoryLevels(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   inventoryItemId: string
 ): Promise<InventoryLevel[]> {
   try {
-    const client = createGraphQLClient(session.shop, session.accessToken);
+    const client = getClient(session);
 
     // Ensure inventoryItemId is in GID format
     const gid = inventoryItemId.startsWith("gid://")
@@ -81,11 +97,11 @@ export async function getInventoryLevels(
  * for a single inventory item. Used during catalog sync for per-location data.
  */
 export async function getInventoryLevelsWithQuantities(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   inventoryItemId: string
 ): Promise<InventoryLevelWithQuantities[]> {
   try {
-    const client = createGraphQLClient(session.shop, session.accessToken);
+    const client = getClient(session);
 
     const gid = inventoryItemId.startsWith("gid://")
       ? inventoryItemId
@@ -117,11 +133,11 @@ export async function getInventoryLevelsWithQuantities(
  * Set inventory quantities using inventorySetQuantities mutation
  */
 export async function setInventoryQuantities(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   input: InventorySetQuantitiesInput
 ): Promise<InventorySetQuantitiesResponse["inventorySetQuantities"]> {
   try {
-    const client = createGraphQLClient(session.shop, session.accessToken);
+    const client = getClient(session);
 
     // Convert all IDs to GID format
     const formattedInput = {
@@ -174,11 +190,11 @@ export async function setInventoryQuantities(
  * Find product variants by SKU
  */
 export async function getProductVariantsBySku(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   sku: string
 ): Promise<ProductVariant[]> {
   try {
-    const client = createGraphQLClient(session.shop, session.accessToken);
+    const client = getClient(session);
 
     // Format SKU query for Shopify search
     const skuQuery = `sku:${sku}`;
@@ -211,10 +227,10 @@ export async function getProductVariantsBySku(
  * Get all location IDs for a store
  */
 export async function getLocationIds(
-  session: { shop: string; accessToken: string }
+  session: ShopSession
 ): Promise<Location[]> {
   try {
-    const client = createGraphQLClient(session.shop, session.accessToken);
+    const client = getClient(session);
 
     const response = await withRetry<GetLocationsResponse>(
       () => client.query<GetLocationsResponse>(LOCATIONS_QUERY, { first: 50 })
@@ -290,7 +306,7 @@ export async function getLocationIds(
  * Checks the DB first (store_locations); falls back to the Shopify API.
  */
 export async function getPrimaryLocation(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   storeId?: string
 ): Promise<Location | null> {
   // Try DB first when storeId is available
@@ -325,7 +341,7 @@ export async function getPrimaryLocation(
  * Returns the upserted StoreLocation records.
  */
 export async function syncStoreLocations(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   storeId: string
 ): Promise<any[]> {
   try {
@@ -387,7 +403,7 @@ export async function syncStoreLocations(
  * If not found in DB, fetches from Shopify API and creates the record.
  */
 export async function getOrCreateLocation(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   storeId: string,
   shopifyLocationId: string | number
 ): Promise<any> {
@@ -439,11 +455,11 @@ export async function getOrCreateLocation(
  * Get inventory item details
  */
 export async function getInventoryItem(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   inventoryItemId: string
 ): Promise<any> {
   try {
-    const client = createGraphQLClient(session.shop, session.accessToken);
+    const client = getClient(session);
 
     const gid = inventoryItemId.startsWith("gid://")
       ? inventoryItemId
@@ -467,7 +483,7 @@ export async function getInventoryItem(
  * Update inventory for a single item at a location
  */
 export async function updateInventoryLevel(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   inventoryItemId: string,
   locationId: string,
   quantity: number,
@@ -492,7 +508,7 @@ export async function updateInventoryLevel(
  * Batch update inventory for multiple items
  */
 export async function batchUpdateInventory(
-  session: { shop: string; accessToken: string },
+  session: ShopSession,
   updates: Array<{
     inventoryItemId: string;
     locationId: string;

@@ -13,6 +13,7 @@ import type { ProductWithRelations } from "~/types";
 import { getProductVariantsBySku, syncStoreLocations, getInventoryLevelsWithQuantities } from "~/lib/shopify/inventory.server";
 import { upsertInventoryLocation, recalculateAggregateInventory } from "~/lib/db/inventory-queries.server";
 import { sessionStorage as storage } from "~/shopify.server";
+import type { GraphQLClient } from "~/shopify.server";
 
 /**
  * Store variant information for mapping
@@ -183,7 +184,12 @@ export async function getAllMappings(
  */
 export async function syncProductCatalog(
   shopDomain: string,
-  accessTokenOverride?: string
+  options?: {
+    /** Pre-authenticated admin GraphQL client from authenticate.admin() */
+    adminGraphQL?: GraphQLClient;
+    /** Raw access token override */
+    accessToken?: string;
+  }
 ): Promise<{
   total: number;
   created: number;
@@ -201,29 +207,47 @@ export async function syncProductCatalog(
       throw new Error(`Store not found: ${shopDomain}`);
     }
 
-    // Resolve access token: override > offline session > Store.accessToken
-    let accessToken: string | undefined = accessTokenOverride;
-    let tokenSource = "override";
+    // Resolve GraphQL client and access token
+    // Priority: admin.graphql() > token override > offline session > Store.accessToken
+    let client: GraphQLClient;
+    let accessToken: string;
+    let tokenSource: string;
 
-    if (!accessToken) {
-      const sessionId = `offline_${shopDomain}`;
-      const session = await storage.loadSession(sessionId);
-      if (session?.accessToken) {
-        accessToken = session.accessToken;
-        tokenSource = "offline_session";
+    if (options?.adminGraphQL) {
+      // Best path: use the authenticated admin client from the Shopify library
+      // This uses token exchange and is guaranteed to work
+      client = options.adminGraphQL;
+      accessToken = options.accessToken || "managed-by-admin-graphql";
+      tokenSource = "admin_graphql";
+    } else {
+      // Fallback: resolve a raw access token
+      let resolvedToken: string | undefined = options?.accessToken;
+      tokenSource = resolvedToken ? "override" : "";
+
+      if (!resolvedToken) {
+        const sessionId = `offline_${shopDomain}`;
+        const session = await storage.loadSession(sessionId);
+        if (session?.accessToken) {
+          resolvedToken = session.accessToken;
+          tokenSource = "offline_session";
+        }
       }
-    }
 
-    if (!accessToken && store.accessToken) {
-      accessToken = store.accessToken;
-      tokenSource = "store_record";
-    }
+      if (!resolvedToken && store.accessToken) {
+        resolvedToken = store.accessToken;
+        tokenSource = "store_record";
+      }
 
-    if (!accessToken) {
-      throw new Error(
-        `No access token found for store: ${shopDomain}. ` +
-        `The store merchant must open the app at least once to generate a valid token.`
-      );
+      if (!resolvedToken) {
+        throw new Error(
+          `No access token found for store: ${shopDomain}. ` +
+          `The store merchant must open the app at least once to generate a valid token.`
+        );
+      }
+
+      accessToken = resolvedToken;
+      const { createGraphQLClient } = await import("~/shopify.server");
+      client = createGraphQLClient(shopDomain, accessToken);
     }
 
     logger.info("Starting product catalog sync", {
@@ -233,14 +257,11 @@ export async function syncProductCatalog(
       accessTokenPrefix: accessToken.substring(0, 8) + "...",
     });
 
-    const { createGraphQLClient } = await import("~/shopify.server");
-    const client = createGraphQLClient(shopDomain, accessToken);
-
     // Sync store locations before iterating products
     const locationLookup = new Map<string, string>();
     try {
       const storeLocations = await syncStoreLocations(
-        { shop: shopDomain, accessToken },
+        { shop: shopDomain, accessToken, graphqlClient: options?.adminGraphQL },
         store.id
       );
 
@@ -400,7 +421,7 @@ export async function syncProductCatalog(
                 });
                 
                 const levels = await getInventoryLevelsWithQuantities(
-                  { shop: shopDomain, accessToken },
+                  { shop: shopDomain, accessToken, graphqlClient: options?.adminGraphQL },
                   variant.inventoryItem.id
                 );
                 
@@ -432,7 +453,7 @@ export async function syncProductCatalog(
                     try {
                       const { getOrCreateLocation } = await import("~/lib/shopify/inventory.server");
                       const storeLocation = await getOrCreateLocation(
-                        { shop: shopDomain, accessToken },
+                        { shop: shopDomain, accessToken, graphqlClient: options?.adminGraphQL },
                         store.id,
                         locationGid
                       );
