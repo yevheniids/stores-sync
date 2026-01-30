@@ -55,6 +55,7 @@ export const shopify = shopifyApp({
     "read_inventory",
     "write_orders",
     "read_orders",
+    "read_locations",
   ],
   appUrl: process.env.SHOPIFY_APP_URL || process.env.HOST || "",
   authPathPrefix: "/auth",
@@ -183,13 +184,17 @@ export function createGraphQLClient(shop: string, accessToken: string) {
       );
 
       if (!response.ok) {
-        throw new Error(`GraphQL request failed: ${response.statusText}`);
+        const error = new Error(`GraphQL request failed: ${response.statusText}`);
+        (error as any).status = response.status;
+        throw error;
       }
 
       const result = await response.json();
 
       if (result.errors) {
-        throw new Error(`GraphQL errors: ${JSON.stringify(result.errors)}`);
+        const error = new Error(`GraphQL errors: ${JSON.stringify(result.errors)}`);
+        (error as any).graphqlErrors = result.errors;
+        throw error;
       }
 
       return result.data;

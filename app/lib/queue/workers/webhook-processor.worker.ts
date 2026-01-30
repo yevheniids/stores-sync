@@ -19,6 +19,12 @@ import type {
   InventoryUpdateJobData,
 } from "~/lib/queue/jobs.server";
 import { gidToId, idToGid } from "~/lib/helpers";
+import { getOrCreateLocation } from "~/lib/shopify/inventory.server";
+import {
+  upsertInventoryLocation,
+  recalculateAggregateInventory,
+} from "~/lib/db/inventory-queries.server";
+import { sessionStorage as storage } from "~/shopify.server";
 
 /**
  * Process webhook job
@@ -267,7 +273,8 @@ async function processRefundCreated(data: RefundCreatedJobData): Promise<void> {
 
 /**
  * Process inventory update webhook
- * Detects manual adjustments and syncs to central database
+ * Detects manual adjustments and syncs to central database.
+ * Now writes per-location data and recalculates the aggregate.
  */
 async function processInventoryUpdate(data: InventoryUpdateJobData): Promise<void> {
   const { eventId, shopDomain, inventoryLevel } = data;
@@ -294,10 +301,11 @@ async function processInventoryUpdate(data: InventoryUpdateJobData): Promise<voi
   }
 
   // Find product mapping by inventory item ID
+  const inventoryItemGid = idToGid(inventoryLevel.inventory_item_id, "InventoryItem");
   const mapping = await prisma.productStoreMapping.findFirst({
     where: {
       storeId: store.id,
-      shopifyInventoryItemId: inventoryLevel.inventory_item_id.toString(),
+      shopifyInventoryItemId: inventoryItemGid,
     },
     include: {
       product: {
@@ -309,13 +317,47 @@ async function processInventoryUpdate(data: InventoryUpdateJobData): Promise<voi
   });
 
   if (!mapping) {
-    logger.warn("No product mapping found for inventory update", {
-      inventoryItemId: inventoryLevel.inventory_item_id,
-      shopDomain,
+    // Also try with raw numeric string for backwards compatibility
+    const mappingFallback = await prisma.productStoreMapping.findFirst({
+      where: {
+        storeId: store.id,
+        shopifyInventoryItemId: inventoryLevel.inventory_item_id.toString(),
+      },
+      include: {
+        product: {
+          include: {
+            inventory: true,
+          },
+        },
+      },
     });
+
+    if (!mappingFallback) {
+      logger.warn("No product mapping found for inventory update", {
+        inventoryItemId: inventoryLevel.inventory_item_id,
+        shopDomain,
+      });
+      return;
+    }
+
+    // Use the fallback mapping — continue below with same logic
+    await processInventoryUpdateForMapping(eventId, shopDomain, store, mappingFallback, inventoryLevel);
     return;
   }
 
+  await processInventoryUpdateForMapping(eventId, shopDomain, store, mapping, inventoryLevel);
+}
+
+/**
+ * Inner handler for processing inventory update once a mapping is resolved.
+ */
+async function processInventoryUpdateForMapping(
+  eventId: string,
+  shopDomain: string,
+  store: { id: string; shopDomain?: string },
+  mapping: any,
+  inventoryLevel: { inventory_item_id: number; location_id: number; available: number }
+): Promise<void> {
   // Check if this update was caused by our own sync to avoid loops
   const recentSyncOp = await prisma.syncOperation.findFirst({
     where: {
@@ -341,13 +383,38 @@ async function processInventoryUpdate(data: InventoryUpdateJobData): Promise<voi
     return;
   }
 
-  // This is a manual adjustment - update central inventory
-  const currentInventory = mapping.product.inventory;
+  // Resolve the location from the webhook's numeric location_id
+  const sessionId = `offline_${shopDomain}`;
+  const session = await storage.loadSession(sessionId);
+
+  if (!session) {
+    logger.warn("No session for store, falling back to aggregate-only update", {
+      shopDomain,
+    });
+    // Fall through to aggregate-only update below
+  }
+
   const newAvailable = inventoryLevel.available;
+  const currentInventory = mapping.product.inventory;
+  const previousValue = currentInventory?.availableQuantity ?? 0;
 
-  if (currentInventory) {
-    const previousValue = currentInventory.availableQuantity;
+  // Update per-location inventory if we can resolve the location
+  if (session) {
+    const storeLocation = await getOrCreateLocation(
+      { shop: session.shop, accessToken: session.accessToken },
+      store.id,
+      inventoryLevel.location_id
+    );
 
+    await upsertInventoryLocation(mapping.productId, storeLocation.id, {
+      availableQuantity: newAvailable,
+      lastAdjustedBy: `webhook-${shopDomain}`,
+    });
+
+    // Recalculate aggregate from all location rows
+    await recalculateAggregateInventory(mapping.productId);
+  } else if (currentInventory) {
+    // No session — update aggregate directly (legacy behavior)
     await prisma.inventory.update({
       where: { id: currentInventory.id },
       data: {
@@ -356,32 +423,33 @@ async function processInventoryUpdate(data: InventoryUpdateJobData): Promise<voi
         lastAdjustedBy: `webhook-${shopDomain}`,
       },
     });
-
-    // Record sync operation
-    await prisma.syncOperation.create({
-      data: {
-        operationType: "INVENTORY_UPDATE",
-        direction: "STORE_TO_CENTRAL",
-        productId: mapping.productId,
-        storeId: store.id,
-        status: "COMPLETED",
-        startedAt: new Date(),
-        completedAt: new Date(),
-        previousValue: { available: previousValue },
-        newValue: { available: newAvailable },
-        triggeredBy: `webhook-${eventId}`,
-      },
-    });
-
-    logger.info("Inventory updated from manual adjustment", {
-      eventId,
-      productId: mapping.productId,
-      sku: mapping.product.sku,
-      previousValue,
-      newValue: newAvailable,
-      difference: newAvailable - previousValue,
-    });
   }
+
+  // Record sync operation
+  await prisma.syncOperation.create({
+    data: {
+      operationType: "INVENTORY_UPDATE",
+      direction: "STORE_TO_CENTRAL",
+      productId: mapping.productId,
+      storeId: store.id,
+      status: "COMPLETED",
+      startedAt: new Date(),
+      completedAt: new Date(),
+      previousValue: { available: previousValue },
+      newValue: { available: newAvailable },
+      triggeredBy: `webhook-${eventId}`,
+    },
+  });
+
+  logger.info("Inventory updated from manual adjustment", {
+    eventId,
+    productId: mapping.productId,
+    sku: mapping.product.sku,
+    locationId: inventoryLevel.location_id,
+    previousValue,
+    newValue: newAvailable,
+    difference: newAvailable - previousValue,
+  });
 }
 
 /**

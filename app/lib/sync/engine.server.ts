@@ -6,7 +6,7 @@
  * Single source of truth for inventory state
  */
 
-import { executeTransaction } from "~/db.server";
+import { executeTransaction, prisma } from "~/db.server";
 import { logger } from "~/lib/logger.server";
 import { storage } from "~/shopify.server";
 import {
@@ -201,11 +201,15 @@ export async function processInventoryChange(
           continue;
         }
 
-        // Get primary location for the store
-        const location = await getPrimaryLocation({
-          shop: session.shop,
-          accessToken: session.accessToken,
+        // Get primary location for the store (DB first, then API fallback)
+        const storeRecord = await prisma.store.findUnique({
+          where: { shopDomain: mapping.store.shopDomain },
         });
+
+        const location = await getPrimaryLocation(
+          { shop: session.shop, accessToken: session.accessToken },
+          storeRecord?.id
+        );
 
         if (!location) {
           logger.warn("No location found for store", {
@@ -431,11 +435,11 @@ export async function syncProductToStore(
       throw new Error(`No session found for store: ${shopDomain}`);
     }
 
-    // Get location
-    const location = await getPrimaryLocation({
-      shop: session.shop,
-      accessToken: session.accessToken,
-    });
+    // Get location (DB first, then API fallback)
+    const location = await getPrimaryLocation(
+      { shop: session.shop, accessToken: session.accessToken },
+      mapping.storeId
+    );
 
     if (!location) {
       throw new Error(`No location found for store: ${shopDomain}`);

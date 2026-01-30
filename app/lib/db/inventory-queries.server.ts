@@ -434,6 +434,118 @@ export async function upsertInventory(
 }
 
 /**
+ * Create or update per-location inventory record
+ */
+export async function upsertInventoryLocation(
+  productId: string,
+  storeLocationId: string,
+  data: {
+    availableQuantity?: number;
+    committedQuantity?: number;
+    incomingQuantity?: number;
+    lastAdjustedBy?: string;
+  }
+): Promise<any> {
+  try {
+    const record = await prisma.inventoryLocation.upsert({
+      where: {
+        productId_storeLocationId: {
+          productId,
+          storeLocationId,
+        },
+      },
+      create: {
+        productId,
+        storeLocationId,
+        availableQuantity: data.availableQuantity ?? 0,
+        committedQuantity: data.committedQuantity ?? 0,
+        incomingQuantity: data.incomingQuantity ?? 0,
+        lastAdjustedAt: new Date(),
+        lastAdjustedBy: data.lastAdjustedBy || "system",
+      },
+      update: {
+        availableQuantity: data.availableQuantity,
+        committedQuantity: data.committedQuantity,
+        incomingQuantity: data.incomingQuantity,
+        lastAdjustedAt: new Date(),
+        lastAdjustedBy: data.lastAdjustedBy,
+      },
+    });
+
+    logger.database("upsert", "inventory_location", {
+      productId,
+      storeLocationId,
+      availableQuantity: record.availableQuantity,
+    });
+
+    return record;
+  } catch (error) {
+    logger.error("Failed to upsert inventory location", error, {
+      productId,
+      storeLocationId,
+      data,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Recalculate aggregate inventory from all InventoryLocation rows for a product.
+ * Sums availableQuantity, committedQuantity, incomingQuantity across all locations.
+ */
+export async function recalculateAggregateInventory(
+  productId: string
+): Promise<Inventory> {
+  try {
+    const aggregation = await prisma.inventoryLocation.aggregate({
+      where: { productId },
+      _sum: {
+        availableQuantity: true,
+        committedQuantity: true,
+        incomingQuantity: true,
+      },
+    });
+
+    const totalAvailable = aggregation._sum.availableQuantity ?? 0;
+    const totalCommitted = aggregation._sum.committedQuantity ?? 0;
+    const totalIncoming = aggregation._sum.incomingQuantity ?? 0;
+
+    const inventory = await prisma.inventory.upsert({
+      where: { productId },
+      create: {
+        productId,
+        availableQuantity: totalAvailable,
+        committedQuantity: totalCommitted,
+        incomingQuantity: totalIncoming,
+        lastAdjustedAt: new Date(),
+        lastAdjustedBy: "aggregate-recalculation",
+      },
+      update: {
+        availableQuantity: totalAvailable,
+        committedQuantity: totalCommitted,
+        incomingQuantity: totalIncoming,
+        lastAdjustedAt: new Date(),
+        lastAdjustedBy: "aggregate-recalculation",
+      },
+    });
+
+    logger.database("upsert", "inventory", {
+      productId,
+      aggregateAvailable: totalAvailable,
+      aggregateCommitted: totalCommitted,
+      aggregateIncoming: totalIncoming,
+    });
+
+    return inventory;
+  } catch (error) {
+    logger.error("Failed to recalculate aggregate inventory", error, {
+      productId,
+    });
+    throw error;
+  }
+}
+
+/**
  * Get sync operation statistics
  */
 export async function getSyncStats(filters?: {
@@ -491,5 +603,7 @@ export default {
   getStoreMapping,
   getAllMappingsForProduct,
   upsertInventory,
+  upsertInventoryLocation,
+  recalculateAggregateInventory,
   getSyncStats,
 };

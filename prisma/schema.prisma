@@ -61,6 +61,7 @@ model Store {
   productMappings   ProductStoreMapping[]
   syncOperations    SyncOperation[]
   conflicts         Conflict[]
+  locations         StoreLocation[]
 
   @@index([shopDomain])
   @@index([isActive])
@@ -96,6 +97,7 @@ model Product {
   storeMappings     ProductStoreMapping[]
   syncOperations    SyncOperation[]
   conflicts         Conflict[]
+  inventoryLocations InventoryLocation[]
 
   @@index([sku])
   @@index([vendor])
@@ -174,6 +176,67 @@ model Inventory {
   @@index([productId])
   @@index([availableQuantity])
   @@map("inventory")
+}
+
+// Physical location within a store
+model StoreLocation {
+  id                  String   @id @default(cuid())
+
+  // Store reference
+  storeId             String
+  store               Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  // Shopify location ID (GID format)
+  shopifyLocationId   String
+
+  // Location details
+  name                String
+  isActive            Boolean  @default(true)
+  address1            String?
+  city                String?
+  province            String?
+  country             String?
+
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  // Relations
+  inventoryLocations  InventoryLocation[]
+
+  @@unique([storeId, shopifyLocationId])
+  @@index([storeId])
+  @@index([shopifyLocationId])
+  @@map("store_locations")
+}
+
+// Inventory at a specific location for a product
+model InventoryLocation {
+  id                  String   @id @default(cuid())
+
+  // Product reference
+  productId           String
+  product             Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // Location reference
+  storeLocationId     String
+  storeLocation       StoreLocation @relation(fields: [storeLocationId], references: [id], onDelete: Cascade)
+
+  // Inventory quantities
+  availableQuantity   Int      @default(0)
+  committedQuantity   Int      @default(0)
+  incomingQuantity    Int      @default(0)
+
+  // Metadata
+  lastAdjustedAt      DateTime?
+  lastAdjustedBy      String?
+
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([productId, storeLocationId])
+  @@index([productId])
+  @@index([storeLocationId])
+  @@map("inventory_locations")
 }
 
 // Webhook event tracking for idempotency

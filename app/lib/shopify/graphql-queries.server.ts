@@ -17,7 +17,10 @@ export const INVENTORY_LEVELS_QUERY = `
         edges {
           node {
             id
-            available
+            quantities(names: ["available"]) {
+              name
+              quantity
+            }
             location {
               id
               name
@@ -160,7 +163,10 @@ export const INVENTORY_ITEM_QUERY = `
         edges {
           node {
             id
-            available
+            quantities(names: ["available"]) {
+              name
+              quantity
+            }
             location {
               id
               name
@@ -249,7 +255,10 @@ export const INVENTORY_LEVELS_BY_LOCATION_QUERY = `
         edges {
           node {
             id
-            available
+            quantities(names: ["available"]) {
+              name
+              quantity
+            }
             item {
               id
               sku
@@ -273,12 +282,41 @@ export const INVENTORY_LEVELS_BY_LOCATION_QUERY = `
 `;
 
 /**
+ * Query to get inventory levels with full quantity breakdown for a single inventory item.
+ * Returns available, committed, and incoming quantities per location.
+ * Used during catalog sync to populate per-location inventory.
+ */
+export const INVENTORY_LEVELS_WITH_QUANTITIES_QUERY = `
+  query GetInventoryLevelsWithQuantities($inventoryItemId: ID!, $first: Int = 50) {
+    inventoryItem(id: $inventoryItemId) {
+      id
+      inventoryLevels(first: $first) {
+        edges {
+          node {
+            quantities(names: ["available", "committed", "incoming"]) {
+              name
+              quantity
+            }
+            location {
+              id
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+/**
  * TypeScript types for GraphQL responses
  */
 
 export interface InventoryLevel {
   id: string;
-  available: number;
+  quantities: Array<{
+    name: string;
+    quantity: number;
+  }>;
   location: {
     id: string;
     name: string;
@@ -370,6 +408,27 @@ export interface GetProductVariantsBySkuResponse {
     edges: Array<{
       node: ProductVariant;
     }>;
+  };
+}
+
+export interface InventoryLevelWithQuantities {
+  quantities: Array<{
+    name: string;
+    quantity: number;
+  }>;
+  location: {
+    id: string;
+  };
+}
+
+export interface GetInventoryLevelsWithQuantitiesResponse {
+  inventoryItem: {
+    id: string;
+    inventoryLevels: {
+      edges: Array<{
+        node: InventoryLevelWithQuantities;
+      }>;
+    };
   };
 }
 

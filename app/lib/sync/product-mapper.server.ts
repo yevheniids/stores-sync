@@ -10,7 +10,8 @@ import { logger } from "~/lib/logger.server";
 import { gidToId } from "~/lib/helpers";
 import type { Product, ProductStoreMapping, Store } from "@prisma/client";
 import type { ProductWithRelations } from "~/types";
-import { getProductVariantsBySku } from "~/lib/shopify/inventory.server";
+import { getProductVariantsBySku, syncStoreLocations, getInventoryLevelsWithQuantities } from "~/lib/shopify/inventory.server";
+import { upsertInventoryLocation, recalculateAggregateInventory } from "~/lib/db/inventory-queries.server";
 import { sessionStorage as storage } from "~/shopify.server";
 
 /**
@@ -212,6 +213,38 @@ export async function syncProductCatalog(
     const { createGraphQLClient } = await import("~/shopify.server");
     const client = createGraphQLClient(session.shop, session.accessToken);
 
+    // Sync store locations before iterating products
+    const locationLookup = new Map<string, string>();
+    try {
+      const storeLocations = await syncStoreLocations(
+        { shop: session.shop, accessToken: session.accessToken },
+        store.id
+      );
+
+      // Build a lookup map: shopifyLocationId -> storeLocation.id
+      for (const loc of storeLocations) {
+        locationLookup.set(loc.shopifyLocationId, loc.id);
+        logger.debug("Added location to lookup", {
+          shopifyLocationId: loc.shopifyLocationId,
+          storeLocationId: loc.id,
+          name: loc.name,
+        });
+      }
+
+      logger.info("Location lookup ready", {
+        shopDomain,
+        locationCount: locationLookup.size,
+        locationIds: Array.from(locationLookup.keys()),
+      });
+    } catch (locErr) {
+      console.error("[syncProductCatalog] LOCATION SYNC FAILED:", locErr);
+      logger.error("Failed to sync store locations, will attempt to create locations on-demand during product sync", locErr, {
+        shopDomain,
+        error: locErr instanceof Error ? locErr.message : String(locErr),
+      });
+      // Don't throw - continue sync, locations will be created on-demand if needed
+    }
+
     let created = 0;
     let updated = 0;
     let errors = 0;
@@ -332,6 +365,133 @@ export async function syncProductCatalog(
             });
 
             if (variant.inventoryItem.tracked) {
+              // Fetch per-location inventory with full quantity breakdown
+              try {
+                logger.debug("Fetching inventory levels for tracked item", {
+                  sku: variant.sku,
+                  inventoryItemId: variant.inventoryItem.id,
+                  locationLookupSize: locationLookup.size,
+                });
+                
+                const levels = await getInventoryLevelsWithQuantities(
+                  { shop: session.shop, accessToken: session.accessToken },
+                  variant.inventoryItem.id
+                );
+                
+                logger.info("Retrieved inventory levels", {
+                  sku: variant.sku,
+                  levelCount: levels.length,
+                  locationIds: levels.map((l: any) => l.location.id),
+                });
+
+                if (levels.length === 0) {
+                  logger.debug("No inventory levels found for tracked item", {
+                    sku: variant.sku,
+                    inventoryItemId: variant.inventoryItem.id,
+                  });
+                }
+
+                for (const level of levels) {
+                  const locationGid = level.location.id;
+                  let storeLocationId = locationLookup.get(locationGid);
+
+                  // If location not in lookup, try to get or create it
+                  if (!storeLocationId) {
+                    logger.debug("Location not in lookup, attempting to get or create", {
+                      locationGid,
+                      sku: variant.sku,
+                      locationLookupSize: locationLookup.size,
+                    });
+                    
+                    try {
+                      const { getOrCreateLocation } = await import("~/lib/shopify/inventory.server");
+                      const storeLocation = await getOrCreateLocation(
+                        { shop: session.shop, accessToken: session.accessToken },
+                        store.id,
+                        locationGid
+                      );
+                      storeLocationId = storeLocation.id;
+                      // Add to lookup for future iterations
+                      locationLookup.set(locationGid, storeLocationId);
+                      logger.info("Created/found location during inventory sync", {
+                        locationGid,
+                        storeLocationId,
+                        sku: variant.sku,
+                      });
+                    } catch (locErr) {
+                      logger.error("Failed to get or create location, skipping inventory level", locErr, {
+                        locationGid,
+                        sku: variant.sku,
+                      });
+                      continue;
+                    }
+                  }
+
+                  if (!storeLocationId) {
+                    logger.warn("Could not resolve store location, skipping inventory level", {
+                      locationGid,
+                      sku: variant.sku,
+                    });
+                    continue;
+                  }
+
+                  const quantities = level.quantities || [];
+                  const available = quantities.find((q: any) => q.name === "available")?.quantity ?? 0;
+                  const committed = quantities.find((q: any) => q.name === "committed")?.quantity ?? 0;
+                  const incoming = quantities.find((q: any) => q.name === "incoming")?.quantity ?? 0;
+
+                  await upsertInventoryLocation(product.id, storeLocationId, {
+                    availableQuantity: available,
+                    committedQuantity: committed,
+                    incomingQuantity: incoming,
+                    lastAdjustedBy: "catalog-sync",
+                  });
+
+                  logger.debug("Upserted inventory location", {
+                    sku: variant.sku,
+                    productId: product.id,
+                    storeLocationId,
+                    available,
+                    committed,
+                    incoming,
+                  });
+                }
+
+                // Recalculate aggregate from all location rows
+                await recalculateAggregateInventory(product.id);
+              } catch (levelErr) {
+                // If per-location fetch fails, fall back to aggregate-only
+                console.error("[syncProductCatalog] INVENTORY LEVELS FETCH FAILED for SKU:", variant.sku, levelErr);
+                logger.warn("Failed to fetch per-location inventory, using aggregate", {
+                  sku: variant.sku,
+                  inventoryItemId: variant.inventoryItem.id,
+                  error: levelErr instanceof Error ? levelErr.message : "Unknown",
+                });
+
+                await prisma.inventory.upsert({
+                  where: { productId: product.id },
+                  create: {
+                    productId: product.id,
+                    availableQuantity: variant.inventoryQuantity || 0,
+                    committedQuantity: 0,
+                    incomingQuantity: 0,
+                    lastAdjustedAt: new Date(),
+                    lastAdjustedBy: "catalog-sync",
+                  },
+                  update: {
+                    availableQuantity: variant.inventoryQuantity || 0,
+                    lastAdjustedAt: new Date(),
+                    lastAdjustedBy: "catalog-sync",
+                  },
+                });
+              }
+            } else if (variant.inventoryItem.tracked) {
+              // Tracked but no inventory levels fetched (shouldn't happen, but fallback)
+              logger.debug("Tracked item but no inventory levels processed, using variant quantity", {
+                sku: variant.sku,
+                inventoryQuantity: variant.inventoryQuantity,
+              });
+              
               await prisma.inventory.upsert({
                 where: { productId: product.id },
                 create: {

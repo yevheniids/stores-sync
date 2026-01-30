@@ -22,8 +22,14 @@ async function main() {
   const mappings = await prisma.productStoreMapping.deleteMany();
   console.log(`  Product mappings:     ${mappings.count} deleted`);
 
+  const invLocations = await prisma.inventoryLocation.deleteMany();
+  console.log(`  Inventory locations:  ${invLocations.count} deleted`);
+
   const inventory = await prisma.inventory.deleteMany();
   console.log(`  Inventory:            ${inventory.count} deleted`);
+
+  const storeLocations = await prisma.storeLocation.deleteMany();
+  console.log(`  Store locations:      ${storeLocations.count} deleted`);
 
   const products = await prisma.product.deleteMany();
   console.log(`  Products:             ${products.count} deleted`);

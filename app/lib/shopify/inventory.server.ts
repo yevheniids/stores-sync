@@ -11,13 +11,17 @@
 import { createGraphQLClient, withRetry } from "~/shopify.server";
 import { logger } from "~/lib/logger.server";
 import { gidToId, idToGid } from "~/lib/helpers";
+import { prisma } from "~/db.server";
 import {
   INVENTORY_LEVELS_QUERY,
+  INVENTORY_LEVELS_WITH_QUANTITIES_QUERY,
   INVENTORY_SET_QUANTITIES_MUTATION,
   PRODUCT_VARIANTS_BY_SKU_QUERY,
   LOCATIONS_QUERY,
   INVENTORY_ITEM_QUERY,
   type GetInventoryLevelsResponse,
+  type GetInventoryLevelsWithQuantitiesResponse,
+  type InventoryLevelWithQuantities,
   type InventorySetQuantitiesResponse,
   type InventorySetQuantitiesInput,
   type GetProductVariantsBySkuResponse,
@@ -65,6 +69,43 @@ export async function getInventoryLevels(
     return levels;
   } catch (error) {
     logger.error("Failed to get inventory levels", error, {
+      shop: session.shop,
+      inventoryItemId,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Get inventory levels with full quantity breakdown (available, committed, incoming)
+ * for a single inventory item. Used during catalog sync for per-location data.
+ */
+export async function getInventoryLevelsWithQuantities(
+  session: { shop: string; accessToken: string },
+  inventoryItemId: string
+): Promise<InventoryLevelWithQuantities[]> {
+  try {
+    const client = createGraphQLClient(session.shop, session.accessToken);
+
+    const gid = inventoryItemId.startsWith("gid://")
+      ? inventoryItemId
+      : idToGid(inventoryItemId, "InventoryItem");
+
+    const response = await withRetry<GetInventoryLevelsWithQuantitiesResponse>(
+      () => client.query<GetInventoryLevelsWithQuantitiesResponse>(
+        INVENTORY_LEVELS_WITH_QUANTITIES_QUERY,
+        { inventoryItemId: gid }
+      )
+    );
+
+    if (!response.inventoryItem) {
+      logger.warn("Inventory item not found for quantities query", { inventoryItemId: gid });
+      return [];
+    }
+
+    return response.inventoryItem.inventoryLevels.edges.map((edge) => edge.node);
+  } catch (error) {
+    logger.error("Failed to get inventory levels with quantities", error, {
       shop: session.shop,
       inventoryItemId,
     });
@@ -191,7 +232,52 @@ export async function getLocationIds(
     });
 
     return activeLocations;
-  } catch (error) {
+  } catch (error: any) {
+    // Check if error is related to missing access scope
+    const errorMessage = error?.message || String(error);
+    const graphqlErrors = error?.graphqlErrors || [];
+    
+    // Check both error message and GraphQL errors array
+    // According to Shopify docs, access scope errors can appear in:
+    // 1. error.message containing "read_locations", "read_markets_home", "access scope", "requiredAccess"
+    // 2. graphqlErrors[].message containing scope-related text
+    // 3. graphqlErrors[].extensions.code === "ACCESS_DENIED"
+    // 4. graphqlErrors[].extensions.requiredAccess containing scope info
+    // 5. graphqlErrors[].extensions.requiredAccess as a string or object
+    const isAccessScopeError = 
+      errorMessage.includes("read_locations") ||
+      errorMessage.includes("read_markets_home") ||
+      errorMessage.includes("access scope") ||
+      errorMessage.includes("requiredAccess") ||
+      errorMessage.includes("ACCESS_DENIED") ||
+      graphqlErrors.some((err: any) => {
+        const errMsg = err?.message || "";
+        const extensions = err?.extensions || {};
+        
+        return (
+          errMsg.includes("read_locations") ||
+          errMsg.includes("read_markets_home") ||
+          errMsg.includes("access scope") ||
+          errMsg.includes("requiredAccess") ||
+          extensions.code === "ACCESS_DENIED" ||
+          extensions.requiredAccess !== undefined ||
+          (typeof extensions.requiredAccess === "string" && 
+           (extensions.requiredAccess.includes("read_locations") || 
+            extensions.requiredAccess.includes("read_markets_home")))
+        );
+      });
+
+    if (isAccessScopeError) {
+      logger.warn("Cannot access locations - missing required scope. App needs 'read_locations' scope (requires 'read_inventory' or 'write_inventory'). Please reinstall the app or use scope expansion API to grant the required permissions.", {
+        shop: session.shop,
+        error: errorMessage,
+        graphqlErrors,
+        hint: "For existing installations, use request_granular_access_scopes endpoint to add read_locations scope",
+      });
+      // Return empty array instead of throwing - allows sync to continue without per-location inventory
+      return [];
+    }
+
     logger.error("Failed to get location IDs", error, {
       shop: session.shop,
     });
@@ -200,13 +286,153 @@ export async function getLocationIds(
 }
 
 /**
- * Get primary location for a store (first active location)
+ * Get primary location for a store.
+ * Checks the DB first (store_locations); falls back to the Shopify API.
  */
 export async function getPrimaryLocation(
-  session: { shop: string; accessToken: string }
+  session: { shop: string; accessToken: string },
+  storeId?: string
 ): Promise<Location | null> {
+  // Try DB first when storeId is available
+  if (storeId) {
+    const dbLocation = await prisma.storeLocation.findFirst({
+      where: { storeId, isActive: true },
+      orderBy: { createdAt: "asc" },
+    });
+
+    if (dbLocation) {
+      return {
+        id: dbLocation.shopifyLocationId,
+        name: dbLocation.name,
+        isActive: dbLocation.isActive,
+        address: {
+          address1: dbLocation.address1 ?? undefined,
+          city: dbLocation.city ?? undefined,
+          province: dbLocation.province ?? undefined,
+          country: dbLocation.country ?? undefined,
+        },
+      };
+    }
+  }
+
+  // Fallback to API
   const locations = await getLocationIds(session);
   return locations.length > 0 ? locations[0] : null;
+}
+
+/**
+ * Fetch all locations from Shopify and upsert into store_locations table.
+ * Returns the upserted StoreLocation records.
+ */
+export async function syncStoreLocations(
+  session: { shop: string; accessToken: string },
+  storeId: string
+): Promise<any[]> {
+  try {
+    console.log("[syncStoreLocations] Fetching locations for", session.shop, "storeId:", storeId);
+    const locations = await getLocationIds(session);
+    console.log("[syncStoreLocations] Got locations from API:", locations.length, JSON.stringify(locations.map(l => ({ id: l.id, name: l.name }))));
+
+    const upserted = [];
+    for (const loc of locations) {
+      console.log("[syncStoreLocations] Upserting location:", loc.id, loc.name);
+      const record = await prisma.storeLocation.upsert({
+        where: {
+          storeId_shopifyLocationId: {
+            storeId,
+            shopifyLocationId: loc.id,
+          },
+        },
+        create: {
+          storeId,
+          shopifyLocationId: loc.id,
+          name: loc.name,
+          isActive: loc.isActive,
+          address1: loc.address?.address1 ?? null,
+          city: loc.address?.city ?? null,
+          province: loc.address?.province ?? null,
+          country: loc.address?.country ?? null,
+        },
+        update: {
+          name: loc.name,
+          isActive: loc.isActive,
+          address1: loc.address?.address1 ?? null,
+          city: loc.address?.city ?? null,
+          province: loc.address?.province ?? null,
+          country: loc.address?.country ?? null,
+        },
+      });
+      upserted.push(record);
+    }
+
+    logger.info("Store locations synced", {
+      shop: session.shop,
+      storeId,
+      locationCount: upserted.length,
+    });
+
+    return upserted;
+  } catch (error) {
+    logger.error("Failed to sync store locations", error, {
+      shop: session.shop,
+      storeId,
+    });
+    throw error;
+  }
+}
+
+/**
+ * Find or create a StoreLocation from a Shopify location ID (numeric REST ID).
+ * Converts the REST numeric ID to GID format for storage.
+ * If not found in DB, fetches from Shopify API and creates the record.
+ */
+export async function getOrCreateLocation(
+  session: { shop: string; accessToken: string },
+  storeId: string,
+  shopifyLocationId: string | number
+): Promise<any> {
+  const locationGid = typeof shopifyLocationId === "string" && shopifyLocationId.startsWith("gid://")
+    ? shopifyLocationId
+    : idToGid(shopifyLocationId, "Location");
+
+  // Check DB first
+  const existing = await prisma.storeLocation.findUnique({
+    where: {
+      storeId_shopifyLocationId: {
+        storeId,
+        shopifyLocationId: locationGid,
+      },
+    },
+  });
+
+  if (existing) {
+    return existing;
+  }
+
+  // Not found — fetch all locations from Shopify and sync
+  const locations = await syncStoreLocations(session, storeId);
+  const match = locations.find((l: any) => l.shopifyLocationId === locationGid);
+
+  if (match) {
+    return match;
+  }
+
+  // Still not found — create a placeholder
+  logger.warn("Location not found in Shopify, creating placeholder", {
+    storeId,
+    shopifyLocationId: locationGid,
+  });
+
+  const placeholder = await prisma.storeLocation.create({
+    data: {
+      storeId,
+      shopifyLocationId: locationGid,
+      name: `Location ${gidToId(locationGid)}`,
+      isActive: true,
+    },
+  });
+
+  return placeholder;
 }
 
 /**
@@ -321,10 +547,13 @@ export function formatGid(id: string | number, resource: string): string {
 
 export default {
   getInventoryLevels,
+  getInventoryLevelsWithQuantities,
   setInventoryQuantities,
   getProductVariantsBySku,
   getLocationIds,
   getPrimaryLocation,
+  syncStoreLocations,
+  getOrCreateLocation,
   getInventoryItem,
   updateInventoryLevel,
   batchUpdateInventory,
