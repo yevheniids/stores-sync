@@ -79,7 +79,6 @@ store-sync-app/
 ### 1. Clone and Install
 
 ```bash
-cd /Users/eugene/Desktop/Projects/self-education/store-sync-app
 npm install
 ```
 
@@ -92,6 +91,7 @@ cp .env.example .env
 ```
 
 Fill in the required values:
+
 - Shopify API credentials
 - Database connection strings
 - Redis connection details
@@ -133,6 +133,7 @@ npm run dev
 ```
 
 This starts:
+
 - Remix development server (with HMR)
 - Shopify CLI tunnel
 - Webhook forwarding
@@ -264,32 +265,6 @@ npm run build
 npm run deploy
 ```
 
-## Roadmap
-
-### Phase 1: Project Setup ✓
-- [x] Project structure
-- [x] Database schema
-- [x] Shopify app configuration
-- [x] Queue system setup
-
-### Phase 2: Core Sync Engine (Next)
-- [ ] Webhook handlers
-- [ ] Sync service implementation
-- [ ] Conflict detection logic
-- [ ] Queue workers
-
-### Phase 3: Admin Dashboard
-- [ ] Store management UI
-- [ ] Product mapping interface
-- [ ] Conflict resolution UI
-- [ ] Sync history viewer
-
-### Phase 4: Advanced Features
-- [ ] Real-time dashboard updates
-- [ ] Analytics and reporting
-- [ ] Bulk operations UI
-- [ ] Scheduled sync configuration
-
 ## Troubleshooting
 
 ### Database Connection Issues
@@ -312,15 +287,3 @@ npm run test:redis
 - Verify HMAC signature validation
 - Check firewall/network settings
 - Review webhook event logs
-
-## Contributing
-
-This is an educational project. Contributions, issues, and feature requests are welcome!
-
-## License
-
-MIT
-
-## Support
-
-For issues and questions, please open a GitHub issue.
