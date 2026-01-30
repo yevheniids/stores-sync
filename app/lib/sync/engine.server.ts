@@ -8,7 +8,7 @@
 
 import { executeTransaction, prisma } from "~/db.server";
 import { logger } from "~/lib/logger.server";
-import { storage } from "~/shopify.server";
+import { sessionStorage as storage } from "~/shopify.server";
 import {
   getInventoryBySku,
   updateInventory,
