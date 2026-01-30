@@ -95,7 +95,7 @@ async function processWebhookJob(job: Job<WebhookProcessingJob>): Promise<void> 
  * Process order created webhook
  * Decreases inventory for each line item
  */
-async function processOrderCreated(data: OrderCreatedJobData): Promise<void> {
+export async function processOrderCreated(data: OrderCreatedJobData): Promise<void> {
   const { eventId, shopDomain, order } = data;
 
   logger.info("Processing order created", {
@@ -151,7 +151,7 @@ async function processOrderCreated(data: OrderCreatedJobData): Promise<void> {
  * Process order cancelled webhook
  * Restores inventory for all line items
  */
-async function processOrderCancelled(data: OrderCancelledJobData): Promise<void> {
+export async function processOrderCancelled(data: OrderCancelledJobData): Promise<void> {
   const { eventId, shopDomain, order } = data;
 
   logger.info("Processing order cancelled", {
@@ -207,7 +207,7 @@ async function processOrderCancelled(data: OrderCancelledJobData): Promise<void>
  * Process refund created webhook
  * Restores inventory only for items marked as restocked
  */
-async function processRefundCreated(data: RefundCreatedJobData): Promise<void> {
+export async function processRefundCreated(data: RefundCreatedJobData): Promise<void> {
   const { eventId, shopDomain, refund } = data;
 
   logger.info("Processing refund created", {
@@ -276,7 +276,7 @@ async function processRefundCreated(data: RefundCreatedJobData): Promise<void> {
  * Detects manual adjustments and syncs to central database.
  * Now writes per-location data and recalculates the aggregate.
  */
-async function processInventoryUpdate(data: InventoryUpdateJobData): Promise<void> {
+export async function processInventoryUpdate(data: InventoryUpdateJobData): Promise<void> {
   const { eventId, shopDomain, inventoryLevel } = data;
 
   logger.info("Processing inventory update", {

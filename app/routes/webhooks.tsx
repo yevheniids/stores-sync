@@ -20,6 +20,7 @@ import {
   markProcessed,
   markFailed,
 } from "~/lib/utils/idempotency.server";
+import { isRedisAvailable } from "~/lib/redis.server";
 import {
   enqueueOrderCreated,
   enqueueOrderCancelled,
@@ -32,6 +33,12 @@ import type {
   RefundCreatedJobData,
   InventoryUpdateJobData,
 } from "~/lib/queue/jobs.server";
+import {
+  processOrderCreated,
+  processOrderCancelled,
+  processRefundCreated,
+  processInventoryUpdate,
+} from "~/lib/queue/workers/webhook-processor.worker";
 
 /**
  * Webhook action handler
@@ -144,29 +151,20 @@ async function handleOrderCreated(
   shopDomain: string,
   payload: any
 ): Promise<void> {
-  try {
-    const data: OrderCreatedJobData = {
-      eventId,
-      shopDomain,
-      order: payload,
-      timestamp: new Date().toISOString(),
-    };
+  const data: OrderCreatedJobData = {
+    eventId,
+    shopDomain,
+    order: payload,
+    timestamp: new Date().toISOString(),
+  };
 
+  if (isRedisAvailable) {
     await enqueueOrderCreated(data);
-
-    logger.info("Order created webhook queued", {
-      eventId,
-      shopDomain,
-      orderId: payload.id,
-      lineItemCount: payload.line_items?.length || 0,
-    });
-  } catch (error) {
-    logger.error("Failed to handle order created webhook", error, {
-      eventId,
-      shopDomain,
-      orderId: payload.id,
-    });
-    throw error;
+    logger.info("Order created webhook queued", { eventId, shopDomain, orderId: payload.id });
+  } else {
+    await processOrderCreated(data);
+    await markProcessed(eventId, "ORDERS_CREATE", shopDomain, payload);
+    logger.info("Order created webhook processed inline", { eventId, shopDomain, orderId: payload.id });
   }
 }
 
@@ -179,29 +177,20 @@ async function handleOrderCancelled(
   shopDomain: string,
   payload: any
 ): Promise<void> {
-  try {
-    const data: OrderCancelledJobData = {
-      eventId,
-      shopDomain,
-      order: payload,
-      timestamp: new Date().toISOString(),
-    };
+  const data: OrderCancelledJobData = {
+    eventId,
+    shopDomain,
+    order: payload,
+    timestamp: new Date().toISOString(),
+  };
 
+  if (isRedisAvailable) {
     await enqueueOrderCancelled(data);
-
-    logger.info("Order cancelled webhook queued", {
-      eventId,
-      shopDomain,
-      orderId: payload.id,
-      lineItemCount: payload.line_items?.length || 0,
-    });
-  } catch (error) {
-    logger.error("Failed to handle order cancelled webhook", error, {
-      eventId,
-      shopDomain,
-      orderId: payload.id,
-    });
-    throw error;
+    logger.info("Order cancelled webhook queued", { eventId, shopDomain, orderId: payload.id });
+  } else {
+    await processOrderCancelled(data);
+    await markProcessed(eventId, "ORDERS_CANCELLED", shopDomain, payload);
+    logger.info("Order cancelled webhook processed inline", { eventId, shopDomain, orderId: payload.id });
   }
 }
 
@@ -214,30 +203,20 @@ async function handleRefundCreated(
   shopDomain: string,
   payload: any
 ): Promise<void> {
-  try {
-    const data: RefundCreatedJobData = {
-      eventId,
-      shopDomain,
-      refund: payload,
-      timestamp: new Date().toISOString(),
-    };
+  const data: RefundCreatedJobData = {
+    eventId,
+    shopDomain,
+    refund: payload,
+    timestamp: new Date().toISOString(),
+  };
 
+  if (isRedisAvailable) {
     await enqueueRefundCreated(data);
-
-    logger.info("Refund created webhook queued", {
-      eventId,
-      shopDomain,
-      refundId: payload.id,
-      orderId: payload.order_id,
-      refundLineItemCount: payload.refund_line_items?.length || 0,
-    });
-  } catch (error) {
-    logger.error("Failed to handle refund created webhook", error, {
-      eventId,
-      shopDomain,
-      refundId: payload.id,
-    });
-    throw error;
+    logger.info("Refund created webhook queued", { eventId, shopDomain, refundId: payload.id });
+  } else {
+    await processRefundCreated(data);
+    await markProcessed(eventId, "REFUNDS_CREATE", shopDomain, payload);
+    logger.info("Refund created webhook processed inline", { eventId, shopDomain, refundId: payload.id });
   }
 }
 
@@ -250,30 +229,20 @@ async function handleInventoryUpdate(
   shopDomain: string,
   payload: any
 ): Promise<void> {
-  try {
-    const data: InventoryUpdateJobData = {
-      eventId,
-      shopDomain,
-      inventoryLevel: payload,
-      timestamp: new Date().toISOString(),
-    };
+  const data: InventoryUpdateJobData = {
+    eventId,
+    shopDomain,
+    inventoryLevel: payload,
+    timestamp: new Date().toISOString(),
+  };
 
+  if (isRedisAvailable) {
     await enqueueInventoryUpdate(data);
-
-    logger.info("Inventory update webhook queued", {
-      eventId,
-      shopDomain,
-      inventoryItemId: payload.inventory_item_id,
-      available: payload.available,
-      locationId: payload.location_id,
-    });
-  } catch (error) {
-    logger.error("Failed to handle inventory update webhook", error, {
-      eventId,
-      shopDomain,
-      inventoryItemId: payload.inventory_item_id,
-    });
-    throw error;
+    logger.info("Inventory update webhook queued", { eventId, shopDomain, inventoryItemId: payload.inventory_item_id });
+  } else {
+    await processInventoryUpdate(data);
+    await markProcessed(eventId, "INVENTORY_LEVELS_UPDATE", shopDomain, payload);
+    logger.info("Inventory update webhook processed inline", { eventId, shopDomain, inventoryItemId: payload.inventory_item_id });
   }
 }
 
