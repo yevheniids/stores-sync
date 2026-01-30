@@ -1,0 +1,19 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+name = "store-sync-app"
+client_id = "434af3761fcac4bd15068a9ef277abcf"
+application_url = "https://localhost:3000"
+embedded = true
+
+[auth]
+redirect_urls = ["https://localhost:3000/auth/callback"]
+
+[access_scopes]
+scopes = "write_products,read_products,write_inventory,read_inventory,write_orders,read_orders"
+
+[webhooks]
+api_version = "2024-10"
+
+[build]
+automatically_update_urls_on_dev = true
+dev_store_url = "ds-test-store-6408.myshopify.com"

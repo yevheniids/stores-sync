@@ -1,0 +1,6 @@
+[commands]
+dev = "npx vite"
+build = "npx remix vite:build"
+
+[auth]
+types = ["partner"]

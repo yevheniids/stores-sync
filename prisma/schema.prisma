@@ -1,0 +1,343 @@
+// Prisma schema for Shopify Inventory Sync App
+// Database: PostgreSQL (via Supabase)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// Session storage for Shopify App Bridge
+model Session {
+  id          String    @id
+  shop        String
+  state       String
+  isOnline    Boolean   @default(false)
+  scope       String?
+  expires     DateTime?
+  accessToken String
+  userId      BigInt?
+  firstName   String?
+  lastName    String?
+  email       String?
+  accountOwner Boolean  @default(false)
+  locale      String?
+  collaborator Boolean? @default(false)
+  emailVerified Boolean? @default(false)
+  refreshToken  String?
+  refreshTokenExpires DateTime?
+
+  @@index([shop])
+}
+
+// Connected Shopify stores
+model Store {
+  id                String   @id @default(cuid())
+  shopDomain        String   @unique // e.g., "store1.myshopify.com"
+  shopName          String   // Display name
+  accessToken       String   // Encrypted access token
+  scope             String   // Granted scopes
+  isActive          Boolean  @default(true)
+  installationDate  DateTime @default(now())
+  lastSyncAt        DateTime?
+
+  // Store metadata
+  currency          String?  @default("USD")
+  timezone          String?
+  country           String?
+
+  // Configuration
+  syncEnabled       Boolean  @default(true)
+  autoSyncInterval  Int?     @default(300) // seconds, default 5 minutes
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  productMappings   ProductStoreMapping[]
+  syncOperations    SyncOperation[]
+  conflicts         Conflict[]
+
+  @@index([shopDomain])
+  @@index([isActive])
+  @@map("stores")
+}
+
+// Central product registry (SKU-based)
+model Product {
+  id                String   @id @default(cuid())
+  sku               String   @unique // Primary identifier across stores
+  title             String
+  description       String?  @db.Text
+
+  // Product attributes
+  vendor            String?
+  productType       String?
+  tags              String[] // Array of tags
+
+  // Central inventory management
+  inventoryPolicy   InventoryPolicy @default(DENY)
+  tracksInventory   Boolean  @default(true)
+
+  // Metadata
+  imageUrl          String?
+  weight            Float?   // in grams
+  weightUnit        String?  @default("g")
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  inventory         Inventory?
+  storeMappings     ProductStoreMapping[]
+  syncOperations    SyncOperation[]
+  conflicts         Conflict[]
+
+  @@index([sku])
+  @@index([vendor])
+  @@index([productType])
+  @@map("products")
+}
+
+// Links central products to store-specific variants
+model ProductStoreMapping {
+  id                String   @id @default(cuid())
+
+  // Central product reference
+  productId         String
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // Store reference
+  storeId           String
+  store             Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  // Shopify-specific IDs
+  shopifyProductId  String   // Shopify Product ID (gid://shopify/Product/...)
+  shopifyVariantId  String   // Shopify Variant ID (gid://shopify/ProductVariant/...)
+  shopifyInventoryItemId String? // Shopify Inventory Item ID
+
+  // Store-specific data
+  price             Float?
+  compareAtPrice    Float?
+  storeSku          String?  // Store may have its own SKU format
+  barcode           String?
+
+  // Sync metadata
+  lastSyncedAt      DateTime?
+  syncStatus        SyncStatus @default(PENDING)
+  syncErrorMessage  String?   @db.Text
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([productId, storeId])
+  @@unique([storeId, shopifyVariantId])
+  @@index([productId])
+  @@index([storeId])
+  @@index([shopifyProductId])
+  @@index([shopifyVariantId])
+  @@index([syncStatus])
+  @@map("product_store_mappings")
+}
+
+// Central inventory (Source of Truth)
+model Inventory {
+  id                String   @id @default(cuid())
+
+  // Product reference
+  productId         String   @unique
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // Inventory quantities
+  availableQuantity Int      @default(0)
+  committedQuantity Int      @default(0) // Reserved for orders
+  incomingQuantity  Int      @default(0) // Expected from suppliers
+
+  // Calculated field: availableQuantity - committedQuantity
+  // onHandQuantity = availableQuantity + committedQuantity
+
+  // Thresholds and alerts
+  lowStockThreshold Int?     @default(10)
+
+  // Metadata
+  lastCountedAt     DateTime?
+  lastAdjustedAt    DateTime?
+  lastAdjustedBy    String?  // User or system that made adjustment
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([productId])
+  @@index([availableQuantity])
+  @@map("inventory")
+}
+
+// Webhook event tracking for idempotency
+model WebhookEvent {
+  id                String   @id @default(cuid())
+
+  // Webhook identification
+  eventId           String   @unique // X-Shopify-Event-Id header
+  topic             String   // e.g., "products/update", "inventory_levels/update"
+  shopDomain        String   // Store that sent the webhook
+
+  // Payload and processing
+  payload           Json     // Full webhook payload
+  processed         Boolean  @default(false)
+  processedAt       DateTime?
+
+  // Error tracking
+  errorMessage      String?  @db.Text
+  retryCount        Int      @default(0)
+  maxRetries        Int      @default(3)
+
+  receivedAt        DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([eventId])
+  @@index([topic])
+  @@index([shopDomain])
+  @@index([processed])
+  @@index([receivedAt])
+  @@map("webhook_events")
+}
+
+// Sync operations audit log
+model SyncOperation {
+  id                String   @id @default(cuid())
+
+  // Operation type
+  operationType     OperationType
+  direction         SyncDirection
+
+  // Related entities
+  productId         String?
+  product           Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  storeId           String?
+  store             Store?    @relation(fields: [storeId], references: [id], onDelete: SetNull)
+
+  // Operation details
+  status            SyncStatus @default(PENDING)
+  startedAt         DateTime  @default(now())
+  completedAt       DateTime?
+
+  // Data tracking
+  previousValue     Json?     // Before sync
+  newValue          Json?     // After sync
+
+  // Error handling
+  errorMessage      String?   @db.Text
+  retryCount        Int       @default(0)
+  maxRetries        Int       @default(3)
+
+  // Metadata
+  triggeredBy       String?   // "webhook", "manual", "scheduled", "api"
+  userId            String?   // If manually triggered
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([operationType])
+  @@index([status])
+  @@index([productId])
+  @@index([storeId])
+  @@index([startedAt])
+  @@index([triggeredBy])
+  @@map("sync_operations")
+}
+
+// Detected conflicts with resolution strategies
+model Conflict {
+  id                String   @id @default(cuid())
+
+  // Conflict identification
+  conflictType      ConflictType
+
+  // Related entities
+  productId         String
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  storeId           String
+  store             Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  // Conflict details
+  centralValue      Json     // Value in central database
+  storeValue        Json     // Value in store
+  detectedAt        DateTime @default(now())
+
+  // Resolution
+  resolutionStrategy ConflictResolutionStrategy @default(USE_DATABASE)
+  resolved          Boolean  @default(false)
+  resolvedAt        DateTime?
+  resolvedBy        String?  // User or system
+  resolvedValue     Json?    // Final value after resolution
+
+  // Metadata
+  notes             String?  @db.Text
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([conflictType])
+  @@index([productId])
+  @@index([storeId])
+  @@index([resolved])
+  @@index([detectedAt])
+  @@map("conflicts")
+}
+
+// Enums
+enum InventoryPolicy {
+  DENY      // Don't allow purchases when out of stock
+  CONTINUE  // Allow purchases when out of stock
+}
+
+enum SyncStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  RETRYING
+  CANCELLED
+}
+
+enum OperationType {
+  INVENTORY_UPDATE
+  PRODUCT_CREATE
+  PRODUCT_UPDATE
+  PRODUCT_DELETE
+  PRICE_UPDATE
+  VARIANT_UPDATE
+  BULK_SYNC
+  INITIAL_SYNC
+}
+
+enum SyncDirection {
+  CENTRAL_TO_STORE  // Push from central DB to Shopify store
+  STORE_TO_CENTRAL  // Pull from Shopify store to central DB
+  BIDIRECTIONAL     // Two-way sync
+}
+
+enum ConflictType {
+  INVENTORY_MISMATCH
+  PRICE_MISMATCH
+  PRODUCT_DATA_MISMATCH
+  VARIANT_MISSING
+  SKU_DUPLICATE
+  SYNC_COLLISION
+}
+
+enum ConflictResolutionStrategy {
+  USE_LOWEST      // Use the lowest quantity (conservative)
+  USE_HIGHEST     // Use the highest quantity (optimistic)
+  USE_DATABASE    // Central database wins
+  USE_STORE       // Store value wins
+  MANUAL          // Requires manual intervention
+  AVERAGE         // Use average of values
+}
