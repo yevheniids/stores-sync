@@ -189,39 +189,45 @@ export async function processInventoryChange(
           continue;
         }
 
-        // Get session for the target store
-        const sessionId = `offline_${mapping.store.shopDomain}`;
-        const session = await storage.loadSession(sessionId);
-
-        if (!session) {
-          logger.warn("No session found for store", {
-            shopDomain: mapping.store.shopDomain,
+        // Resolve access token: offline session > Store.accessToken
+        const targetShop = mapping.store.shopDomain;
+        let targetAccessToken: string | undefined;
+        const offlineSession = await storage.loadSession(`offline_${targetShop}`);
+        if (offlineSession?.accessToken) {
+          targetAccessToken = offlineSession.accessToken;
+        } else {
+          const storeForToken = await prisma.store.findUnique({
+            where: { shopDomain: targetShop },
+            select: { accessToken: true },
           });
+          targetAccessToken = storeForToken?.accessToken || undefined;
+        }
+
+        if (!targetAccessToken) {
+          logger.warn("No access token found for store", { shopDomain: targetShop });
           failureCount++;
           continue;
         }
 
         // Get primary location for the store (DB first, then API fallback)
         const storeRecord = await prisma.store.findUnique({
-          where: { shopDomain: mapping.store.shopDomain },
+          where: { shopDomain: targetShop },
         });
 
         const location = await getPrimaryLocation(
-          { shop: session.shop, accessToken: session.accessToken },
+          { shop: targetShop, accessToken: targetAccessToken },
           storeRecord?.id
         );
 
         if (!location) {
-          logger.warn("No location found for store", {
-            shopDomain: mapping.store.shopDomain,
-          });
+          logger.warn("No location found for store", { shopDomain: targetShop });
           failureCount++;
           continue;
         }
 
         // Update inventory in Shopify
         await updateInventoryLevel(
-          { shop: session.shop, accessToken: session.accessToken },
+          { shop: targetShop, accessToken: targetAccessToken },
           mapping.shopifyInventoryItemId!,
           location.id,
           result.inventory.availableQuantity,
@@ -427,17 +433,26 @@ export async function syncProductToStore(
       throw new Error(`No mapping found for store: ${shopDomain}`);
     }
 
-    // Get session
-    const sessionId = `offline_${shopDomain}`;
-    const session = await storage.loadSession(sessionId);
+    // Resolve access token: offline session > Store.accessToken
+    let syncAccessToken: string | undefined;
+    const offlineSession = await storage.loadSession(`offline_${shopDomain}`);
+    if (offlineSession?.accessToken) {
+      syncAccessToken = offlineSession.accessToken;
+    } else {
+      const storeForToken = await prisma.store.findUnique({
+        where: { shopDomain },
+        select: { accessToken: true },
+      });
+      syncAccessToken = storeForToken?.accessToken || undefined;
+    }
 
-    if (!session) {
-      throw new Error(`No session found for store: ${shopDomain}`);
+    if (!syncAccessToken) {
+      throw new Error(`No access token found for store: ${shopDomain}`);
     }
 
     // Get location (DB first, then API fallback)
     const location = await getPrimaryLocation(
-      { shop: session.shop, accessToken: session.accessToken },
+      { shop: shopDomain, accessToken: syncAccessToken },
       mapping.storeId
     );
 
@@ -447,7 +462,7 @@ export async function syncProductToStore(
 
     // Update inventory
     await updateInventoryLevel(
-      { shop: session.shop, accessToken: session.accessToken },
+      { shop: shopDomain, accessToken: syncAccessToken },
       mapping.shopifyInventoryItemId!,
       location.id,
       product.inventory.availableQuantity,

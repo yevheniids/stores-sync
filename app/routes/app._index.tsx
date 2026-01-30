@@ -22,7 +22,28 @@ import { SyncStatusCard } from "~/components/dashboard/SyncStatusCard";
 import { SyncHistoryLog } from "~/components/dashboard/SyncHistoryLog";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  await authenticate.admin(request);
+  const { session: adminSession } = await authenticate.admin(request);
+
+  // Refresh Store.accessToken on every authenticated request
+  // so the sync engine always has a valid token
+  if (adminSession.accessToken) {
+    await prisma.store.upsert({
+      where: { shopDomain: adminSession.shop },
+      create: {
+        shopDomain: adminSession.shop,
+        shopName: adminSession.shop,
+        accessToken: adminSession.accessToken,
+        scope: adminSession.scope || "",
+        isActive: true,
+        syncEnabled: true,
+      },
+      update: {
+        accessToken: adminSession.accessToken,
+        updatedAt: new Date(),
+      },
+    });
+  }
+
   const formData = await request.formData();
   const actionType = formData.get("action");
 
@@ -37,7 +58,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     for (const store of stores) {
       const startedAt = new Date();
       try {
-        const stats = await syncProductCatalog(store.shopDomain);
+        // Pass the current admin session's token for the matching store
+        const tokenOverride =
+          store.shopDomain === adminSession.shop
+            ? adminSession.accessToken
+            : undefined;
+        const stats = await syncProductCatalog(store.shopDomain, tokenOverride);
         results.push({ shopDomain: store.shopDomain, ...stats, success: true });
 
         await prisma.syncOperation.create({
@@ -98,7 +124,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  // app.tsx already authenticates — no need to call authenticate.admin() again
+  // Authenticate and refresh Store.accessToken on every page load
+  const { session: loaderSession } = await authenticate.admin(request);
+  if (loaderSession.accessToken) {
+    await prisma.store.upsert({
+      where: { shopDomain: loaderSession.shop },
+      create: {
+        shopDomain: loaderSession.shop,
+        shopName: loaderSession.shop,
+        accessToken: loaderSession.accessToken,
+        scope: loaderSession.scope || "",
+        isActive: true,
+        syncEnabled: true,
+      },
+      update: {
+        accessToken: loaderSession.accessToken,
+        updatedAt: new Date(),
+      },
+    });
+  }
 
   const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 

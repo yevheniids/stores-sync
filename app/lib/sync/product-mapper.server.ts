@@ -182,7 +182,8 @@ export async function getAllMappings(
  * Discovers products and creates mappings
  */
 export async function syncProductCatalog(
-  shopDomain: string
+  shopDomain: string,
+  accessTokenOverride?: string
 ): Promise<{
   total: number;
   created: number;
@@ -200,29 +201,46 @@ export async function syncProductCatalog(
       throw new Error(`Store not found: ${shopDomain}`);
     }
 
-    // Get session for API access
-    const sessionId = `offline_${shopDomain}`;
-    const session = await storage.loadSession(sessionId);
+    // Resolve access token: override > offline session > Store.accessToken
+    let accessToken: string | undefined = accessTokenOverride;
+    let tokenSource = "override";
 
-    if (!session) {
-      throw new Error(`No session found for store: ${shopDomain}. Session ID tried: ${sessionId}`);
+    if (!accessToken) {
+      const sessionId = `offline_${shopDomain}`;
+      const session = await storage.loadSession(sessionId);
+      if (session?.accessToken) {
+        accessToken = session.accessToken;
+        tokenSource = "offline_session";
+      }
+    }
+
+    if (!accessToken && store.accessToken) {
+      accessToken = store.accessToken;
+      tokenSource = "store_record";
+    }
+
+    if (!accessToken) {
+      throw new Error(
+        `No access token found for store: ${shopDomain}. ` +
+        `The store merchant must open the app at least once to generate a valid token.`
+      );
     }
 
     logger.info("Starting product catalog sync", {
       shopDomain,
-      sessionShop: session.shop,
-      hasAccessToken: !!session.accessToken,
-      accessTokenPrefix: session.accessToken ? session.accessToken.substring(0, 8) + "..." : "none",
+      tokenSource,
+      hasAccessToken: true,
+      accessTokenPrefix: accessToken.substring(0, 8) + "...",
     });
 
     const { createGraphQLClient } = await import("~/shopify.server");
-    const client = createGraphQLClient(session.shop, session.accessToken);
+    const client = createGraphQLClient(shopDomain, accessToken);
 
     // Sync store locations before iterating products
     const locationLookup = new Map<string, string>();
     try {
       const storeLocations = await syncStoreLocations(
-        { shop: session.shop, accessToken: session.accessToken },
+        { shop: shopDomain, accessToken },
         store.id
       );
 
@@ -382,7 +400,7 @@ export async function syncProductCatalog(
                 });
                 
                 const levels = await getInventoryLevelsWithQuantities(
-                  { shop: session.shop, accessToken: session.accessToken },
+                  { shop: shopDomain, accessToken },
                   variant.inventoryItem.id
                 );
                 
@@ -414,7 +432,7 @@ export async function syncProductCatalog(
                     try {
                       const { getOrCreateLocation } = await import("~/lib/shopify/inventory.server");
                       const storeLocation = await getOrCreateLocation(
-                        { shop: session.shop, accessToken: session.accessToken },
+                        { shop: shopDomain, accessToken },
                         store.id,
                         locationGid
                       );
@@ -648,17 +666,23 @@ export async function discoverAndMapProduct(
       throw new Error(`Store not found: ${shopDomain}`);
     }
 
-    // Get session
+    // Resolve access token: offline session > Store.accessToken
+    let accessToken: string | undefined;
     const sessionId = `offline_${shopDomain}`;
     const session = await storage.loadSession(sessionId);
+    if (session?.accessToken) {
+      accessToken = session.accessToken;
+    } else if (store.accessToken) {
+      accessToken = store.accessToken;
+    }
 
-    if (!session) {
-      throw new Error(`No session found for store: ${shopDomain}`);
+    if (!accessToken) {
+      throw new Error(`No access token found for store: ${shopDomain}`);
     }
 
     // Find variant in Shopify by SKU
     const variants = await getProductVariantsBySku(
-      { shop: session.shop, accessToken: session.accessToken },
+      { shop: shopDomain, accessToken },
       sku
     );
 
