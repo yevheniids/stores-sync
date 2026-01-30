@@ -205,10 +205,15 @@ export async function syncProductCatalog(
     const session = await storage.loadSession(sessionId);
 
     if (!session) {
-      throw new Error(`No session found for store: ${shopDomain}`);
+      throw new Error(`No session found for store: ${shopDomain}. Session ID tried: ${sessionId}`);
     }
 
-    logger.info("Starting product catalog sync", { shopDomain });
+    logger.info("Starting product catalog sync", {
+      shopDomain,
+      sessionShop: session.shop,
+      hasAccessToken: !!session.accessToken,
+      accessTokenPrefix: session.accessToken ? session.accessToken.substring(0, 8) + "..." : "none",
+    });
 
     const { createGraphQLClient } = await import("~/shopify.server");
     const client = createGraphQLClient(session.shop, session.accessToken);
@@ -297,7 +302,10 @@ export async function syncProductCatalog(
         response = await client.query(PRODUCTS_QUERY, variables);
       } catch (err) {
         logger.error("GraphQL products query failed", err, { shopDomain });
-        break;
+        // Surface the error instead of silently returning 0 results
+        throw new Error(
+          `GraphQL query failed for ${shopDomain}: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
 
       const products = response.products.edges.map((e: any) => e.node);
