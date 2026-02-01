@@ -11,7 +11,7 @@ import { gidToId } from "~/lib/helpers";
 import type { Product, ProductStoreMapping, Store } from "@prisma/client";
 import type { ProductWithRelations } from "~/types";
 import { getProductVariantsBySku, syncStoreLocations, getOrCreateLocation } from "~/lib/shopify/inventory.server";
-import { upsertInventoryLocation, recalculateAggregateInventory } from "~/lib/db/inventory-queries.server";
+import { unifiedInventoryUpdate, recalculateAggregateInventory } from "~/lib/db/inventory-queries.server";
 import { sessionStorage as storage } from "~/shopify.server";
 
 /**
@@ -443,11 +443,17 @@ export async function syncProductCatalog(
                 const committed = quantities.find((q: any) => q.name === "committed")?.quantity ?? 0;
                 const incoming = quantities.find((q: any) => q.name === "incoming")?.quantity ?? 0;
 
-                await upsertInventoryLocation(product.id, storeLocationId, {
-                  availableQuantity: available,
-                  committedQuantity: committed,
-                  incomingQuantity: incoming,
-                  lastAdjustedBy: "catalog-sync",
+                await unifiedInventoryUpdate({
+                  sku: variant.sku,
+                  productId: product.id,
+                  adjustedBy: "catalog-sync",
+                  absolute: {
+                    availableQuantity: available,
+                    committedQuantity: committed,
+                    incomingQuantity: incoming,
+                    storeLocationId,
+                    skipRecalculation: true, // batch: recalculate once after loop
+                  },
                 });
               }
 
@@ -455,20 +461,14 @@ export async function syncProductCatalog(
               if (levels.length > 0) {
                 await recalculateAggregateInventory(product.id);
               } else {
-                await prisma.inventory.upsert({
-                  where: { productId: product.id },
-                  create: {
-                    productId: product.id,
+                await unifiedInventoryUpdate({
+                  sku: variant.sku,
+                  productId: product.id,
+                  adjustedBy: "catalog-sync",
+                  setAggregate: {
                     availableQuantity: variant.inventoryQuantity || 0,
                     committedQuantity: 0,
                     incomingQuantity: 0,
-                    lastAdjustedAt: new Date(),
-                    lastAdjustedBy: "catalog-sync",
-                  },
-                  update: {
-                    availableQuantity: variant.inventoryQuantity || 0,
-                    lastAdjustedAt: new Date(),
-                    lastAdjustedBy: "catalog-sync",
                   },
                 });
               }

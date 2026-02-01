@@ -546,6 +546,160 @@ export async function recalculateAggregateInventory(
 }
 
 /**
+ * Unified inventory update — single entry point for all 6 write paths.
+ *
+ * Modes:
+ *   absolute   – catalog sync / inventory webhook (location known): upsert location row, recalculate aggregate
+ *   delta      – order create/cancel/refund: arithmetic on current aggregate (atomic)
+ *   setAggregate – product webhook / fallback when no location data: direct upsert of aggregate
+ */
+export async function unifiedInventoryUpdate(params: {
+  sku: string;
+  productId?: string;
+  adjustedBy: string;
+
+  absolute?: {
+    availableQuantity: number;
+    committedQuantity?: number;
+    incomingQuantity?: number;
+    storeLocationId: string;
+    skipRecalculation?: boolean;
+  };
+  delta?: {
+    availableQuantityChange: number;
+    committedQuantityChange?: number;
+    storeLocationId?: string;
+  };
+  setAggregate?: {
+    availableQuantity: number;
+    committedQuantity?: number;
+    incomingQuantity?: number;
+  };
+}): Promise<{
+  productId: string;
+  previousAggregate: { available: number; committed: number; incoming: number };
+  newAggregate: { available: number; committed: number; incoming: number };
+  mode: "absolute" | "delta" | "setAggregate";
+}> {
+  const { sku, adjustedBy } = params;
+
+  // Resolve productId — caller may supply it to skip a lookup
+  let productId = params.productId;
+  if (!productId) {
+    const product = await prisma.product.findUnique({ where: { sku } });
+    if (!product) throw new Error(`Product not found for SKU: ${sku}`);
+    productId = product.id;
+  }
+
+  // Ensure Inventory record exists before any operation
+  const existing = await prisma.inventory.upsert({
+    where: { productId },
+    create: {
+      productId,
+      availableQuantity: 0,
+      committedQuantity: 0,
+      incomingQuantity: 0,
+      lastAdjustedAt: new Date(),
+      lastAdjustedBy: adjustedBy,
+    },
+    update: {},
+  });
+
+  const previousAggregate = {
+    available: existing.availableQuantity,
+    committed: existing.committedQuantity,
+    incoming: existing.incomingQuantity,
+  };
+
+  // --- MODE A: absolute (per-location → recalculate) ---
+  if (params.absolute) {
+    const a = params.absolute;
+    await upsertInventoryLocation(productId, a.storeLocationId, {
+      availableQuantity: a.availableQuantity,
+      committedQuantity: a.committedQuantity,
+      incomingQuantity: a.incomingQuantity,
+      lastAdjustedBy: adjustedBy,
+    });
+
+    let updated = existing;
+    if (!a.skipRecalculation) {
+      updated = await recalculateAggregateInventory(productId);
+    }
+
+    return {
+      productId,
+      previousAggregate,
+      newAggregate: {
+        available: updated.availableQuantity,
+        committed: updated.committedQuantity,
+        incoming: updated.incomingQuantity,
+      },
+      mode: "absolute",
+    };
+  }
+
+  // --- MODE B: delta (atomic increment/decrement) ---
+  if (params.delta) {
+    const d = params.delta;
+    const updated = await executeTransaction(async (tx) => {
+      const current = await tx.inventory.findUniqueOrThrow({ where: { productId } });
+
+      const newAvailable = Math.max(0, current.availableQuantity + d.availableQuantityChange);
+      const newCommitted = Math.max(0, current.committedQuantity + (d.committedQuantityChange ?? 0));
+
+      return tx.inventory.update({
+        where: { productId },
+        data: {
+          availableQuantity: newAvailable,
+          committedQuantity: newCommitted,
+          lastAdjustedAt: new Date(),
+          lastAdjustedBy: adjustedBy,
+        },
+      });
+    });
+
+    return {
+      productId,
+      previousAggregate,
+      newAggregate: {
+        available: updated.availableQuantity,
+        committed: updated.committedQuantity,
+        incoming: updated.incomingQuantity,
+      },
+      mode: "delta",
+    };
+  }
+
+  // --- MODE C: setAggregate (direct overwrite) ---
+  if (params.setAggregate) {
+    const s = params.setAggregate;
+    const updated = await prisma.inventory.update({
+      where: { productId },
+      data: {
+        availableQuantity: s.availableQuantity,
+        committedQuantity: s.committedQuantity,
+        incomingQuantity: s.incomingQuantity,
+        lastAdjustedAt: new Date(),
+        lastAdjustedBy: adjustedBy,
+      },
+    });
+
+    return {
+      productId,
+      previousAggregate,
+      newAggregate: {
+        available: updated.availableQuantity,
+        committed: updated.committedQuantity,
+        incoming: updated.incomingQuantity,
+      },
+      mode: "setAggregate",
+    };
+  }
+
+  throw new Error("unifiedInventoryUpdate: exactly one of absolute | delta | setAggregate must be provided");
+}
+
+/**
  * Get sync operation statistics
  */
 export async function getSyncStats(filters?: {
@@ -605,5 +759,6 @@ export default {
   upsertInventory,
   upsertInventoryLocation,
   recalculateAggregateInventory,
+  unifiedInventoryUpdate,
   getSyncStats,
 };

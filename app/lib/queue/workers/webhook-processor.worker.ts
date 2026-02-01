@@ -21,8 +21,7 @@ import type {
 import { gidToId, idToGid } from "~/lib/helpers";
 import { getOrCreateLocation } from "~/lib/shopify/inventory.server";
 import {
-  upsertInventoryLocation,
-  recalculateAggregateInventory,
+  unifiedInventoryUpdate,
 } from "~/lib/db/inventory-queries.server";
 import { sessionStorage as storage } from "~/shopify.server";
 
@@ -387,69 +386,90 @@ async function processInventoryUpdateForMapping(
   const sessionId = `offline_${shopDomain}`;
   const session = await storage.loadSession(sessionId);
 
-  if (!session) {
-    logger.warn("No session for store, falling back to aggregate-only update", {
-      shopDomain,
-    });
-    // Fall through to aggregate-only update below
-  }
-
   const newAvailable = inventoryLevel.available;
-  const currentInventory = mapping.product.inventory;
-  const previousValue = currentInventory?.availableQuantity ?? 0;
 
-  // Update per-location inventory if we can resolve the location
   if (session) {
+    // Resolve location → absolute mode (per-location + recalculate)
     const storeLocation = await getOrCreateLocation(
       { shop: session.shop, accessToken: session.accessToken },
       store.id,
       inventoryLevel.location_id
     );
 
-    await upsertInventoryLocation(mapping.productId, storeLocation.id, {
-      availableQuantity: newAvailable,
-      lastAdjustedBy: `webhook-${shopDomain}`,
-    });
-
-    // Recalculate aggregate from all location rows
-    await recalculateAggregateInventory(mapping.productId);
-  } else if (currentInventory) {
-    // No session — update aggregate directly (legacy behavior)
-    await prisma.inventory.update({
-      where: { id: currentInventory.id },
-      data: {
+    const result = await unifiedInventoryUpdate({
+      sku: mapping.product.sku,
+      productId: mapping.productId,
+      adjustedBy: `webhook-${shopDomain}`,
+      absolute: {
         availableQuantity: newAvailable,
-        lastAdjustedAt: new Date(),
-        lastAdjustedBy: `webhook-${shopDomain}`,
+        storeLocationId: storeLocation.id,
       },
     });
-  }
 
-  // Record sync operation
-  await prisma.syncOperation.create({
-    data: {
-      operationType: "INVENTORY_UPDATE",
-      direction: "STORE_TO_CENTRAL",
+    // Record sync operation
+    await prisma.syncOperation.create({
+      data: {
+        operationType: "INVENTORY_UPDATE",
+        direction: "STORE_TO_CENTRAL",
+        productId: mapping.productId,
+        storeId: store.id,
+        status: "COMPLETED",
+        startedAt: new Date(),
+        completedAt: new Date(),
+        previousValue: { available: result.previousAggregate.available },
+        newValue: { available: result.newAggregate.available },
+        triggeredBy: `webhook-${eventId}`,
+      },
+    });
+
+    logger.info("Inventory updated from manual adjustment (absolute)", {
+      eventId,
       productId: mapping.productId,
-      storeId: store.id,
-      status: "COMPLETED",
-      startedAt: new Date(),
-      completedAt: new Date(),
-      previousValue: { available: previousValue },
-      newValue: { available: newAvailable },
-      triggeredBy: `webhook-${eventId}`,
-    },
-  });
+      sku: mapping.product.sku,
+      locationId: inventoryLevel.location_id,
+      previousValue: result.previousAggregate.available,
+      newValue: result.newAggregate.available,
+    });
+  } else {
+    // No session — setAggregate fallback
+    logger.warn("No session for store, falling back to setAggregate update", {
+      shopDomain,
+    });
 
-  logger.info("Inventory updated from manual adjustment", {
-    eventId,
-    productId: mapping.productId,
-    sku: mapping.product.sku,
-    locationId: inventoryLevel.location_id,
-    previousValue,
-    newValue: newAvailable,
-    difference: newAvailable - previousValue,
-  });
+    const result = await unifiedInventoryUpdate({
+      sku: mapping.product.sku,
+      productId: mapping.productId,
+      adjustedBy: `webhook-${shopDomain}`,
+      setAggregate: {
+        availableQuantity: newAvailable,
+      },
+    });
+
+    // Record sync operation
+    await prisma.syncOperation.create({
+      data: {
+        operationType: "INVENTORY_UPDATE",
+        direction: "STORE_TO_CENTRAL",
+        productId: mapping.productId,
+        storeId: store.id,
+        status: "COMPLETED",
+        startedAt: new Date(),
+        completedAt: new Date(),
+        previousValue: { available: result.previousAggregate.available },
+        newValue: { available: result.newAggregate.available },
+        triggeredBy: `webhook-${eventId}`,
+      },
+    });
+
+    logger.info("Inventory updated from manual adjustment (setAggregate)", {
+      eventId,
+      productId: mapping.productId,
+      sku: mapping.product.sku,
+      locationId: inventoryLevel.location_id,
+      previousValue: result.previousAggregate.available,
+      newValue: result.newAggregate.available,
+    });
+  }
 }
 
 /**
@@ -463,117 +483,36 @@ async function decreaseInventoryForLineItem(
   reference: string,
   eventId: string
 ): Promise<void> {
-  // Find product by SKU
-  let product = await prisma.product.findUnique({
-    where: { sku },
-    include: {
-      inventory: true,
-      storeMappings: {
-        where: { storeId },
-      },
-    },
-  });
+  // Ensure product exists (discover if needed)
+  let product = await prisma.product.findUnique({ where: { sku } });
 
   if (!product) {
-    // Try to discover the product from the source store
     logger.warn("Product not found for SKU in order, attempting discovery", {
-      sku,
-      reference,
-      shopDomain,
+      sku, reference, shopDomain,
     });
 
     const { discoverAndMapProduct } = await import("~/lib/sync/product-mapper.server");
     const mapping = await discoverAndMapProduct(shopDomain, sku);
 
     if (!mapping) {
-      logger.error("Product not found and could not be discovered", {
-        sku,
-        shopDomain,
-        reference,
-      });
+      logger.error("Product not found and could not be discovered", { sku, shopDomain, reference });
       return;
     }
 
-    // Reload product with mappings after discovery
-    product = await prisma.product.findUnique({
-      where: { sku },
-      include: {
-        inventory: true,
-        storeMappings: {
-          where: { storeId },
-        },
-      },
-    });
-
+    product = await prisma.product.findUnique({ where: { sku } });
     if (!product) {
-      logger.error("Product still not found after discovery", {
-        sku,
-        shopDomain,
-      });
+      logger.error("Product still not found after discovery", { sku, shopDomain });
       return;
     }
-
-    logger.info("Product discovered and mapped successfully", {
-      sku,
-      productId: product.id,
-      shopDomain,
-    });
   }
 
-  // Create inventory record if it doesn't exist
-  if (!product.inventory) {
-    logger.info("Creating inventory record for product", {
-      productId: product.id,
-      sku,
-      reference,
-    });
-    
-    await prisma.inventory.create({
-      data: {
-        productId: product.id,
-        availableQuantity: 0,
-        committedQuantity: 0,
-        incomingQuantity: 0,
-        lastAdjustedAt: new Date(),
-        lastAdjustedBy: `webhook-${reference}`,
-      },
-    });
-    
-    // Reload product with inventory
-    const updatedProduct = await prisma.product.findUnique({
-      where: { sku },
-      include: {
-        inventory: true,
-        storeMappings: {
-          where: { storeId },
-        },
-      },
-    });
-    
-    if (!updatedProduct || !updatedProduct.inventory) {
-      logger.error("Failed to create inventory record", {
-        productId: product.id,
-        sku,
-      });
-      return;
-    }
-    
-    product = updatedProduct;
-  }
-
-  const previousQuantity = product.inventory.availableQuantity;
-  const newQuantity = Math.max(0, previousQuantity - quantity); // Don't go negative
-
-  // Update central inventory
-  await prisma.inventory.update({
-    where: { id: product.inventory.id },
-    data: {
-      availableQuantity: newQuantity,
-      committedQuantity: {
-        increment: quantity,
-      },
-      lastAdjustedAt: new Date(),
-      lastAdjustedBy: `webhook-${reference}`,
+  const result = await unifiedInventoryUpdate({
+    sku,
+    productId: product.id,
+    adjustedBy: `webhook-${reference}`,
+    delta: {
+      availableQuantityChange: -quantity,
+      committedQuantityChange: quantity,
     },
   });
 
@@ -588,23 +527,18 @@ async function decreaseInventoryForLineItem(
       startedAt: new Date(),
       completedAt: new Date(),
       previousValue: {
-        available: previousQuantity,
-        committed: product.inventory.committedQuantity,
+        available: result.previousAggregate.available,
+        committed: result.previousAggregate.committed,
       },
       newValue: {
-        available: newQuantity,
-        committed: product.inventory.committedQuantity + quantity,
+        available: result.newAggregate.available,
+        committed: result.newAggregate.committed,
       },
       triggeredBy: `webhook-${eventId}`,
     },
   });
 
-  logger.sync(
-    "INVENTORY_UPDATE",
-    product.id,
-    storeId,
-    "completed"
-  );
+  logger.sync("INVENTORY_UPDATE", product.id, storeId, "completed");
 }
 
 /**
@@ -618,117 +552,36 @@ async function increaseInventoryForLineItem(
   reference: string,
   eventId: string
 ): Promise<void> {
-  // Find product by SKU
-  let product = await prisma.product.findUnique({
-    where: { sku },
-    include: {
-      inventory: true,
-      storeMappings: {
-        where: { storeId },
-      },
-    },
-  });
+  // Ensure product exists (discover if needed)
+  let product = await prisma.product.findUnique({ where: { sku } });
 
   if (!product) {
-    // Try to discover the product from the source store
     logger.warn("Product not found for SKU in cancellation/refund, attempting discovery", {
-      sku,
-      reference,
-      shopDomain,
+      sku, reference, shopDomain,
     });
 
     const { discoverAndMapProduct } = await import("~/lib/sync/product-mapper.server");
     const mapping = await discoverAndMapProduct(shopDomain, sku);
 
     if (!mapping) {
-      logger.error("Product not found and could not be discovered", {
-        sku,
-        shopDomain,
-        reference,
-      });
+      logger.error("Product not found and could not be discovered", { sku, shopDomain, reference });
       return;
     }
 
-    // Reload product with mappings after discovery
-    product = await prisma.product.findUnique({
-      where: { sku },
-      include: {
-        inventory: true,
-        storeMappings: {
-          where: { storeId },
-        },
-      },
-    });
-
+    product = await prisma.product.findUnique({ where: { sku } });
     if (!product) {
-      logger.error("Product still not found after discovery", {
-        sku,
-        shopDomain,
-      });
+      logger.error("Product still not found after discovery", { sku, shopDomain });
       return;
     }
-
-    logger.info("Product discovered and mapped successfully", {
-      sku,
-      productId: product.id,
-      shopDomain,
-    });
   }
 
-  // Create inventory record if it doesn't exist
-  if (!product.inventory) {
-    logger.info("Creating inventory record for product", {
-      productId: product.id,
-      sku,
-      reference,
-    });
-    
-    await prisma.inventory.create({
-      data: {
-        productId: product.id,
-        availableQuantity: 0,
-        committedQuantity: 0,
-        incomingQuantity: 0,
-        lastAdjustedAt: new Date(),
-        lastAdjustedBy: `webhook-${reference}`,
-      },
-    });
-    
-    // Reload product with inventory
-    const updatedProduct = await prisma.product.findUnique({
-      where: { sku },
-      include: {
-        inventory: true,
-        storeMappings: {
-          where: { storeId },
-        },
-      },
-    });
-    
-    if (!updatedProduct || !updatedProduct.inventory) {
-      logger.error("Failed to create inventory record", {
-        productId: product.id,
-        sku,
-      });
-      return;
-    }
-    
-    product = updatedProduct;
-  }
-
-  const previousQuantity = product.inventory.availableQuantity;
-  const previousCommitted = product.inventory.committedQuantity;
-  const newQuantity = previousQuantity + quantity;
-  const newCommitted = Math.max(0, previousCommitted - quantity); // Don't go negative
-
-  // Update central inventory
-  await prisma.inventory.update({
-    where: { id: product.inventory.id },
-    data: {
-      availableQuantity: newQuantity,
-      committedQuantity: newCommitted,
-      lastAdjustedAt: new Date(),
-      lastAdjustedBy: `webhook-${reference}`,
+  const result = await unifiedInventoryUpdate({
+    sku,
+    productId: product.id,
+    adjustedBy: `webhook-${reference}`,
+    delta: {
+      availableQuantityChange: quantity,
+      committedQuantityChange: -quantity,
     },
   });
 
@@ -743,23 +596,18 @@ async function increaseInventoryForLineItem(
       startedAt: new Date(),
       completedAt: new Date(),
       previousValue: {
-        available: previousQuantity,
-        committed: previousCommitted,
+        available: result.previousAggregate.available,
+        committed: result.previousAggregate.committed,
       },
       newValue: {
-        available: newQuantity,
-        committed: newCommitted,
+        available: result.newAggregate.available,
+        committed: result.newAggregate.committed,
       },
       triggeredBy: `webhook-${eventId}`,
     },
   });
 
-  logger.sync(
-    "INVENTORY_UPDATE",
-    product.id,
-    storeId,
-    "completed"
-  );
+  logger.sync("INVENTORY_UPDATE", product.id, storeId, "completed");
 }
 
 /**

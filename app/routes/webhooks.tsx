@@ -28,6 +28,7 @@ import {
   enqueueRefundCreated,
   enqueueInventoryUpdate,
 } from "~/lib/queue/jobs.server";
+import { unifiedInventoryUpdate } from "~/lib/db/inventory-queries.server";
 import type {
   OrderCreatedJobData,
   OrderCancelledJobData,
@@ -382,22 +383,14 @@ async function handleProductCreateOrUpdate(
         },
       });
 
-      // Upsert inventory record
+      // Upsert inventory record via unified function
       if (variant.inventory_management === "shopify") {
-        await prisma.inventory.upsert({
-          where: { productId: product.id },
-          create: {
-            productId: product.id,
+        await unifiedInventoryUpdate({
+          sku,
+          productId: product.id,
+          adjustedBy: `webhook-product-${eventId}`,
+          setAggregate: {
             availableQuantity: variant.inventory_quantity || 0,
-            committedQuantity: 0,
-            incomingQuantity: 0,
-            lastAdjustedAt: new Date(),
-            lastAdjustedBy: `webhook-product-${eventId}`,
-          },
-          update: {
-            availableQuantity: variant.inventory_quantity || 0,
-            lastAdjustedAt: new Date(),
-            lastAdjustedBy: `webhook-product-${eventId}`,
           },
         });
       }
