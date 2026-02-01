@@ -239,6 +239,7 @@ export async function syncProductCatalog(
     const { createGraphQLClient } = await import("~/shopify.server");
     const client = createGraphQLClient(shopDomain, accessToken);
 
+    console.log(`[SYNC] Starting catalog sync for ${shopDomain}, tokenSource=${tokenSource}, tokenPrefix=${accessToken.substring(0, 10)}...`);
     logger.info("Starting product catalog sync", {
       shopDomain,
       tokenSource,
@@ -336,8 +337,13 @@ export async function syncProductCatalog(
       hasNextPage = response.products.pageInfo.hasNextPage;
       cursor = response.products.pageInfo.endCursor;
 
+      console.log(`[SYNC] Got ${products.length} products from Shopify (hasNextPage=${hasNextPage})`);
+
       for (const shopifyProduct of products) {
         total++;
+        const variantSkus = shopifyProduct.variants.edges.map((e: any) => e.node.sku).filter(Boolean);
+        console.log(`[SYNC] Product "${shopifyProduct.title}" — ${shopifyProduct.variants.edges.length} variants, SKUs: [${variantSkus.join(", ")}]`);
+
         for (const variantEdge of shopifyProduct.variants.edges) {
           const variant = variantEdge.node;
           if (!variant.sku) continue;
@@ -421,12 +427,15 @@ export async function syncProductCatalog(
             if (existing) {
               updated++;
               updatedSkus.push(variant.sku);
+              console.log(`[SYNC] Updated SKU=${variant.sku} productId=${product.id} qty=${variant.inventoryQuantity}`);
             } else {
               created++;
               createdSkus.push(variant.sku);
+              console.log(`[SYNC] Created SKU=${variant.sku} productId=${product.id} qty=${variant.inventoryQuantity}`);
             }
           } catch (err) {
             errors++;
+            console.error(`[SYNC] FAILED SKU=${variant.sku}:`, err instanceof Error ? err.message : err);
             logger.error("Failed to sync product variant", err, {
               shopDomain,
               sku: variant.sku,
@@ -442,6 +451,7 @@ export async function syncProductCatalog(
     }
 
     const stats = { total, created, updated, errors, createdSkus, updatedSkus };
+    console.log(`[SYNC] DONE ${shopDomain}: total=${total} created=${created} updated=${updated} errors=${errors}`);
     logger.info("Product catalog sync completed", { shopDomain, total, created, updated, errors });
     return stats;
   } catch (error) {

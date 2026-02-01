@@ -69,6 +69,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ success: false, error: "No active stores found" }, { status: 400 });
     }
 
+    console.log(`[ACTION] syncAll: ${stores.length} stores, current=${adminSession.shop}, hasToken=${!!adminSession.accessToken}`);
+
     const results: any[] = [];
     for (const store of stores) {
       const startedAt = new Date();
@@ -77,6 +79,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         // authenticate.admin(). For other stores fall back to Store.accessToken
         // (which was refreshed when that store's merchant last opened the app).
         const isCurrentStore = store.shopDomain === adminSession.shop;
+        console.log(`[ACTION] Syncing ${store.shopDomain} isCurrentStore=${isCurrentStore} storeToken=${store.accessToken?.substring(0, 10)}...`);
         const stats = await syncProductCatalog(store.shopDomain, {
           accessToken: isCurrentStore ? adminSession.accessToken : undefined,
         });
