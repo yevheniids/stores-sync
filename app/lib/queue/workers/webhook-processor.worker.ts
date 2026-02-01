@@ -357,12 +357,16 @@ async function processInventoryUpdateForMapping(
   mapping: any,
   inventoryLevel: { inventory_item_id: number; location_id: number; available: number }
 ): Promise<void> {
-  // Check if this update was caused by our own sync to avoid loops
-  const recentSyncOp = await prisma.syncOperation.findFirst({
+  // Check if this update was caused by our own outbound sync to avoid loops.
+  // Only skip if WE recently pushed inventory TO this store (CENTRAL_TO_STORE),
+  // which would cause Shopify to echo it back as a webhook.
+  // Duplicate webhooks for the same event are already handled by idempotency (eventId).
+  const recentOutboundSync = await prisma.syncOperation.findFirst({
     where: {
       productId: mapping.productId,
       storeId: store.id,
       operationType: "INVENTORY_UPDATE",
+      direction: "CENTRAL_TO_STORE",
       status: "COMPLETED",
       completedAt: {
         gte: new Date(Date.now() - 60000), // Within last minute
@@ -373,11 +377,11 @@ async function processInventoryUpdateForMapping(
     },
   });
 
-  if (recentSyncOp) {
-    logger.debug("Skipping inventory update - caused by our own sync", {
+  if (recentOutboundSync) {
+    logger.info("Skipping inventory update - echo from our own outbound sync", {
       eventId,
       productId: mapping.productId,
-      syncOpId: recentSyncOp.id,
+      syncOpId: recentOutboundSync.id,
     });
     return;
   }
