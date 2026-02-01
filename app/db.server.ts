@@ -15,15 +15,42 @@ declare global {
 }
 
 /**
+ * Build datasource URL with serverless-friendly pool settings.
+ * Appends pgbouncer=true, connection_limit=1, and pool_timeout=30
+ * to work with Supabase pooler on Vercel serverless.
+ */
+function getDatasourceUrl(): string | undefined {
+  const url = process.env.DATABASE_URL;
+  if (!url) return undefined;
+
+  const params: Record<string, string> = {
+    pgbouncer: "true",
+    connection_limit: "1",
+    pool_timeout: "30",
+  };
+
+  const parsed = new URL(url);
+  for (const [key, value] of Object.entries(params)) {
+    if (!parsed.searchParams.has(key)) {
+      parsed.searchParams.set(key, value);
+    }
+  }
+  return parsed.toString();
+}
+
+/**
  * Create and configure Prisma client
  */
 function createPrismaClient(): PrismaClient {
+  const datasourceUrl = getDatasourceUrl();
+
   const client = new PrismaClient({
     log:
       process.env.NODE_ENV === "development"
         ? ["query", "error", "warn"]
         : ["error"],
     errorFormat: "pretty",
+    ...(datasourceUrl ? { datasourceUrl } : {}),
   });
 
   return client;
