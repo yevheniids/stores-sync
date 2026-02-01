@@ -20,6 +20,7 @@ import {
   markProcessed,
   markFailed,
 } from "~/lib/utils/idempotency.server";
+import { idToGid } from "~/lib/helpers";
 import { isRedisAvailable } from "~/lib/redis.server";
 import {
   enqueueOrderCreated,
@@ -339,7 +340,13 @@ async function handleProductCreateOrUpdate(
         },
       });
 
-      // Upsert store mapping
+      // Upsert store mapping — use GID format to match catalog sync
+      const productGid = idToGid(payload.id, "Product");
+      const variantGid = idToGid(variant.id, "ProductVariant");
+      const inventoryItemGid = variant.inventory_item_id
+        ? idToGid(variant.inventory_item_id, "InventoryItem")
+        : undefined;
+
       await prisma.productStoreMapping.upsert({
         where: {
           productId_storeId: {
@@ -350,11 +357,9 @@ async function handleProductCreateOrUpdate(
         create: {
           productId: product.id,
           storeId: store.id,
-          shopifyProductId: String(payload.id),
-          shopifyVariantId: String(variant.id),
-          shopifyInventoryItemId: variant.inventory_item_id
-            ? String(variant.inventory_item_id)
-            : undefined,
+          shopifyProductId: productGid,
+          shopifyVariantId: variantGid,
+          shopifyInventoryItemId: inventoryItemGid,
           price: variant.price ? parseFloat(variant.price) : undefined,
           compareAtPrice: variant.compare_at_price
             ? parseFloat(variant.compare_at_price)
@@ -365,11 +370,9 @@ async function handleProductCreateOrUpdate(
           lastSyncedAt: new Date(),
         },
         update: {
-          shopifyProductId: String(payload.id),
-          shopifyVariantId: String(variant.id),
-          shopifyInventoryItemId: variant.inventory_item_id
-            ? String(variant.inventory_item_id)
-            : undefined,
+          shopifyProductId: productGid,
+          shopifyVariantId: variantGid,
+          shopifyInventoryItemId: inventoryItemGid,
           price: variant.price ? parseFloat(variant.price) : undefined,
           compareAtPrice: variant.compare_at_price
             ? parseFloat(variant.compare_at_price)
@@ -461,11 +464,12 @@ async function handleProductDelete(
       return;
     }
 
-    // Find and remove mappings for this Shopify product
+    // Find and remove mappings for this Shopify product (GID format)
+    const productGid = idToGid(payload.id, "Product");
     const deletedMappings = await prisma.productStoreMapping.deleteMany({
       where: {
         storeId: store.id,
-        shopifyProductId: String(payload.id),
+        shopifyProductId: productGid,
       },
     });
 
