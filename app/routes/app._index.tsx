@@ -20,14 +20,11 @@ import { authenticate } from "~/shopify.server";
 import { syncProductCatalog } from "~/lib/sync/product-mapper.server";
 import { SyncStatusCard } from "~/components/dashboard/SyncStatusCard";
 import { SyncHistoryLog } from "~/components/dashboard/SyncHistoryLog";
-import { isRedisAvailable } from "~/lib/redis.server";
-import { queues } from "~/lib/queue.server";
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session: adminSession, admin } = await authenticate.admin(request);
+  const { session: adminSession } = await authenticate.admin(request);
 
-  // Refresh Store.accessToken on every authenticated request
-  // so the sync engine always has a valid token
+  // Always refresh Store.accessToken with the latest token from authenticate.admin()
   if (adminSession.accessToken) {
     await prisma.store.upsert({
       where: { shopDomain: adminSession.shop },
@@ -49,6 +46,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
   const actionType = formData.get("action");
 
+  // ── Reset Authentication ──────────────────────────────────────────────
+  // Deletes all stale Session records from PrismaSessionStorage.
+  // After this, the next page load triggers fresh token exchange with Shopify,
+  // which generates new valid access tokens.
+  if (actionType === "resetAuth") {
+    const deleted = await prisma.session.deleteMany({});
+    return json({
+      success: true,
+      message:
+        `Cleared ${deleted.count} stale session(s). ` +
+        `Reload this page (and open the app from each other store) to generate fresh tokens. ` +
+        `Then click "Sync to Database".`,
+    });
+  }
+
+  // ── Sync All Stores ───────────────────────────────────────────────────
   if (actionType === "syncAll") {
     const stores = await prisma.store.findMany({ where: { isActive: true } });
 
@@ -56,67 +69,53 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({ success: false, error: "No active stores found" }, { status: 400 });
     }
 
-    // When Redis is available, run sync in background so the request returns immediately
-    // and the button re-enables; avoids Vercel 300s timeout and keeps UI responsive.
-    if (isRedisAvailable) {
-      try {
-        await queues.batchOperations.add(
-          "catalog-sync",
-          {
-            operationType: "initial_sync",
-            data: { triggeredBy: "manual", timestamp: new Date().toISOString() },
-          },
-          { jobId: `catalog-sync-${Date.now()}`, attempts: 1 }
-        );
-        return json(
-          {
-            success: true,
-            message:
-              "Sync started in the background. This may take a few minutes. Refresh the page to see progress.",
-            results: [],
-          },
-          { status: 202 }
-        );
-      } catch (err) {
-        console.error("Failed to enqueue catalog sync:", err);
-        return json(
-          { success: false, error: "Failed to start sync. Try again or run sync without Redis." },
-          { status: 500 }
-        );
-      }
-    }
-
-    const results = [];
+    const results: any[] = [];
     for (const store of stores) {
       const startedAt = new Date();
       try {
-        // Pass current store's token when syncing that store (we just refreshed it above).
-        // All stores use token-based GraphQL client for reliability on serverless (Vercel).
+        // For the currently authenticated store use the fresh token from
+        // authenticate.admin(). For other stores fall back to Store.accessToken
+        // (which was refreshed when that store's merchant last opened the app).
         const isCurrentStore = store.shopDomain === adminSession.shop;
         const stats = await syncProductCatalog(store.shopDomain, {
           accessToken: isCurrentStore ? adminSession.accessToken : undefined,
         });
-        results.push({ shopDomain: store.shopDomain, ...stats, success: true });
 
-        await prisma.syncOperation.create({
-          data: {
-            operationType: "BULK_SYNC",
-            direction: "STORE_TO_CENTRAL",
-            storeId: store.id,
-            status: "COMPLETED",
-            startedAt,
-            completedAt: new Date(),
-            newValue: { created: stats.created, updated: stats.updated, total: stats.total },
-            triggeredBy: "manual",
-          },
-        });
+        if (stats.errorMessage) {
+          results.push({ shopDomain: store.shopDomain, success: false, error: stats.errorMessage });
+          await prisma.syncOperation.create({
+            data: {
+              operationType: "BULK_SYNC",
+              direction: "STORE_TO_CENTRAL",
+              storeId: store.id,
+              status: "FAILED",
+              startedAt,
+              completedAt: new Date(),
+              errorMessage: stats.errorMessage,
+              triggeredBy: "manual",
+            },
+          });
+        } else {
+          results.push({ shopDomain: store.shopDomain, ...stats, success: true });
+          await prisma.syncOperation.create({
+            data: {
+              operationType: "BULK_SYNC",
+              direction: "STORE_TO_CENTRAL",
+              storeId: store.id,
+              status: "COMPLETED",
+              startedAt,
+              completedAt: new Date(),
+              newValue: { created: stats.created, updated: stats.updated, total: stats.total },
+              triggeredBy: "manual",
+            },
+          });
+        }
       } catch (error) {
         results.push({
           shopDomain: store.shopDomain,
           success: false,
           error: error instanceof Error ? error.message : "Sync failed",
         });
-
         await prisma.syncOperation.create({
           data: {
             operationType: "BULK_SYNC",
@@ -132,32 +131,36 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
     }
 
-    const totalCreated = results.reduce((sum, r) => sum + (r.created || 0), 0);
-    const totalUpdated = results.reduce((sum, r) => sum + (r.updated || 0), 0);
-    const allUpdatedSkus = results.flatMap((r) => r.updatedSkus || []);
-    const allCreatedSkus = results.flatMap((r) => r.createdSkus || []);
-    const failed = results.filter((r) => !r.success);
+    const totalCreated = results.reduce((sum: number, r: any) => sum + (r.created || 0), 0);
+    const totalUpdated = results.reduce((sum: number, r: any) => sum + (r.updated || 0), 0);
+    const allCreatedSkus = results.flatMap((r: any) => r.createdSkus || []);
+    const allUpdatedSkus = results.flatMap((r: any) => r.updatedSkus || []);
+    const failed = results.filter((r: any) => !r.success);
 
     let message = `Synced ${results.length} store(s): ${totalCreated} created, ${totalUpdated} updated`;
-    if (failed.length > 0) message += `, ${failed.length} failed`;
-    if (allUpdatedSkus.length > 0) message += `\nUpdated SKUs: ${allUpdatedSkus.join(", ")}`;
+    if (failed.length > 0) {
+      message += `, ${failed.length} failed`;
+      for (const f of failed) {
+        message += `\n${f.shopDomain}: ${f.error}`;
+      }
+    }
     if (allCreatedSkus.length > 0 && allCreatedSkus.length <= 20) {
       message += `\nCreated SKUs: ${allCreatedSkus.join(", ")}`;
     }
+    if (allUpdatedSkus.length > 0) {
+      message += `\nUpdated SKUs: ${allUpdatedSkus.join(", ")}`;
+    }
 
-    return json({
-      success: failed.length === 0,
-      message,
-      results,
-    });
+    return json({ success: failed.length === 0, message, results });
   }
 
   return json({ success: false, error: "Unknown action" }, { status: 400 });
 };
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  // Authenticate and refresh Store.accessToken on every page load
   const { session: loaderSession } = await authenticate.admin(request);
+
+  // Refresh Store.accessToken on every page load
   if (loaderSession.accessToken) {
     await prisma.store.upsert({
       where: { shopDomain: loaderSession.shop },
@@ -217,13 +220,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         : "healthy";
 
     return json({
-      stats: {
-        totalProducts,
-        connectedStores,
-        pendingConflicts,
-        recentSyncs,
-        failedSyncs,
-      },
+      stats: { totalProducts, connectedStores, pendingConflicts, recentSyncs, failedSyncs },
       recentOperations: recentOperations.map((op) => ({
         id: op.id,
         operationType: op.operationType,
@@ -239,13 +236,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   } catch (error) {
     console.error("Dashboard loader error:", error);
     return json({
-      stats: {
-        totalProducts: 0,
-        connectedStores: 0,
-        pendingConflicts: 0,
-        recentSyncs: 0,
-        failedSyncs: 0,
-      },
+      stats: { totalProducts: 0, connectedStores: 0, pendingConflicts: 0, recentSyncs: 0, failedSyncs: 0 },
       recentOperations: [],
       syncHealth: "healthy" as const,
       lastSyncAt: null,
@@ -267,19 +258,27 @@ export default function DashboardIndex() {
     submit(formData, { method: "post" });
   }, [submit]);
 
+  const handleResetAuth = useCallback(() => {
+    if (confirm("This will clear all stored sessions and force re-authentication. Continue?")) {
+      const formData = new FormData();
+      formData.append("action", "resetAuth");
+      submit(formData, { method: "post" });
+    }
+  }, [submit]);
+
   return (
     <Page title="Dashboard">
       <BlockStack gap="500">
-        {(actionData?.message || actionData?.error) && (
+        {(actionData as any)?.message || (actionData as any)?.error ? (
           <Banner
-            title={actionData.success ? "Sync completed" : "Sync error"}
-            tone={actionData.success ? "success" : "critical"}
+            title={(actionData as any).success ? "Success" : "Error"}
+            tone={(actionData as any).success ? "success" : "critical"}
           >
-            {(actionData.message || actionData.error || "").split("\n").map((line, i) => (
+            {((actionData as any).message || (actionData as any).error || "").split("\n").map((line: string, i: number) => (
               <p key={i}>{line}</p>
             ))}
           </Banner>
-        )}
+        ) : null}
 
         <Card>
           <BlockStack gap="400">
@@ -292,13 +291,14 @@ export default function DashboardIndex() {
                   Sync products from all connected Shopify stores to the central database
                 </Text>
               </BlockStack>
-              <Button
-                variant="primary"
-                onClick={handleSyncAll}
-                loading={isSyncing}
-              >
-                Sync to Database
-              </Button>
+              <InlineStack gap="200">
+                <Button onClick={handleResetAuth} loading={isSyncing} tone="critical" variant="plain">
+                  Reset Auth
+                </Button>
+                <Button variant="primary" onClick={handleSyncAll} loading={isSyncing}>
+                  Sync to Database
+                </Button>
+              </InlineStack>
             </InlineStack>
           </BlockStack>
         </Card>
@@ -314,50 +314,28 @@ export default function DashboardIndex() {
             <InlineGrid columns={1} gap="400">
               <Card>
                 <BlockStack gap="200">
-                  <Text as="h2" variant="headingMd">
-                    Products
-                  </Text>
-                  <Text as="p" variant="heading2xl">
-                    {data.stats.totalProducts}
-                  </Text>
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    Total synced products
-                  </Text>
+                  <Text as="h2" variant="headingMd">Products</Text>
+                  <Text as="p" variant="heading2xl">{data.stats.totalProducts}</Text>
+                  <Text as="p" variant="bodySm" tone="subdued">Total synced products</Text>
                 </BlockStack>
               </Card>
-
               <Card>
                 <BlockStack gap="200">
-                  <Text as="h2" variant="headingMd">
-                    Connected Stores
-                  </Text>
-                  <Text as="p" variant="heading2xl">
-                    {data.stats.connectedStores}
-                  </Text>
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    Active store connections
-                  </Text>
+                  <Text as="h2" variant="headingMd">Connected Stores</Text>
+                  <Text as="p" variant="heading2xl">{data.stats.connectedStores}</Text>
+                  <Text as="p" variant="bodySm" tone="subdued">Active store connections</Text>
                 </BlockStack>
               </Card>
-
               <Card>
                 <BlockStack gap="200">
                   <InlineStack align="space-between" blockAlign="center">
-                    <Text as="h2" variant="headingMd">
-                      Pending Conflicts
-                    </Text>
+                    <Text as="h2" variant="headingMd">Pending Conflicts</Text>
                     {data.stats.pendingConflicts > 0 && (
-                      <Badge tone="warning">
-                        {data.stats.pendingConflicts}
-                      </Badge>
+                      <Badge tone="warning">{data.stats.pendingConflicts}</Badge>
                     )}
                   </InlineStack>
-                  <Text as="p" variant="heading2xl">
-                    {data.stats.pendingConflicts}
-                  </Text>
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    Requiring resolution
-                  </Text>
+                  <Text as="p" variant="heading2xl">{data.stats.pendingConflicts}</Text>
+                  <Text as="p" variant="bodySm" tone="subdued">Requiring resolution</Text>
                 </BlockStack>
               </Card>
             </InlineGrid>
@@ -366,21 +344,15 @@ export default function DashboardIndex() {
           <Layout.Section variant="oneThird">
             <Card>
               <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">
-                  Last 24 Hours
-                </Text>
+                <Text as="h2" variant="headingMd">Last 24 Hours</Text>
                 <Divider />
                 <BlockStack gap="300">
                   <InlineStack align="space-between">
-                    <Text as="p" variant="bodyMd">
-                      Successful Syncs
-                    </Text>
+                    <Text as="p" variant="bodyMd">Successful Syncs</Text>
                     <Badge tone="success">{data.stats.recentSyncs}</Badge>
                   </InlineStack>
                   <InlineStack align="space-between">
-                    <Text as="p" variant="bodyMd">
-                      Failed Syncs
-                    </Text>
+                    <Text as="p" variant="bodyMd">Failed Syncs</Text>
                     <Badge tone={data.stats.failedSyncs > 0 ? "critical" : "info"}>
                       {data.stats.failedSyncs}
                     </Badge>
@@ -393,18 +365,14 @@ export default function DashboardIndex() {
           <Layout.Section variant="oneThird">
             <Card>
               <BlockStack gap="300">
-                <Text as="h2" variant="headingMd">
-                  Sync Health Status
-                </Text>
+                <Text as="h2" variant="headingMd">Sync Health Status</Text>
                 <Divider />
                 <Box paddingBlock="400">
                   <InlineStack align="center" blockAlign="center" gap="200">
                     <Badge
                       tone={
-                        data.syncHealth === "healthy"
-                          ? "success"
-                          : data.syncHealth === "warning"
-                          ? "warning"
+                        data.syncHealth === "healthy" ? "success"
+                          : data.syncHealth === "warning" ? "warning"
                           : "critical"
                       }
                       size="large"
@@ -412,10 +380,8 @@ export default function DashboardIndex() {
                       {data.syncHealth.toUpperCase()}
                     </Badge>
                     <Text as="p" variant="bodyMd" tone="subdued">
-                      {data.syncHealth === "healthy"
-                        ? "All systems operational"
-                        : data.syncHealth === "warning"
-                        ? "Minor issues detected"
+                      {data.syncHealth === "healthy" ? "All systems operational"
+                        : data.syncHealth === "warning" ? "Minor issues detected"
                         : "Attention required"}
                     </Text>
                   </InlineStack>
@@ -427,9 +393,7 @@ export default function DashboardIndex() {
 
         <Card>
           <BlockStack gap="400">
-            <Text as="h2" variant="headingMd">
-              Recent Sync Operations
-            </Text>
+            <Text as="h2" variant="headingMd">Recent Sync Operations</Text>
             <Divider />
             <SyncHistoryLog operations={data.recentOperations} compact />
           </BlockStack>

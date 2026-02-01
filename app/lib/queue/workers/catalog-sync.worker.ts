@@ -35,19 +35,38 @@ async function processCatalogSyncJob(job: Job<BatchOperationJob>): Promise<void>
     const startedAt = new Date();
     try {
       const stats = await syncProductCatalog(store.shopDomain, {});
-      await prisma.syncOperation.create({
-        data: {
-          operationType: "BULK_SYNC",
-          direction: "STORE_TO_CENTRAL",
-          storeId: store.id,
-          status: "COMPLETED",
-          startedAt,
-          completedAt: new Date(),
-          newValue: { created: stats.created, updated: stats.updated, total: stats.total },
-          triggeredBy,
-        },
-      });
-      logger.info("Catalog sync completed for store", { shopDomain: store.shopDomain, ...stats });
+      if (stats.errorMessage) {
+        await prisma.syncOperation.create({
+          data: {
+            operationType: "BULK_SYNC",
+            direction: "STORE_TO_CENTRAL",
+            storeId: store.id,
+            status: "FAILED",
+            startedAt,
+            completedAt: new Date(),
+            errorMessage: stats.errorMessage,
+            triggeredBy,
+          },
+        });
+        logger.warn("Catalog sync skipped for store (token expired/invalid)", {
+          shopDomain: store.shopDomain,
+          message: stats.errorMessage,
+        });
+      } else {
+        await prisma.syncOperation.create({
+          data: {
+            operationType: "BULK_SYNC",
+            direction: "STORE_TO_CENTRAL",
+            storeId: store.id,
+            status: "COMPLETED",
+            startedAt,
+            completedAt: new Date(),
+            newValue: { created: stats.created, updated: stats.updated, total: stats.total },
+            triggeredBy,
+          },
+        });
+        logger.info("Catalog sync completed for store", { shopDomain: store.shopDomain, ...stats });
+      }
     } catch (error) {
       await prisma.syncOperation.create({
         data: {

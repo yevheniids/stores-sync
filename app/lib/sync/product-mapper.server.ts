@@ -10,8 +10,7 @@ import { logger } from "~/lib/logger.server";
 import { gidToId } from "~/lib/helpers";
 import type { Product, ProductStoreMapping, Store } from "@prisma/client";
 import type { ProductWithRelations } from "~/types";
-import { getProductVariantsBySku, syncStoreLocations, getInventoryLevelsWithQuantities } from "~/lib/shopify/inventory.server";
-import { upsertInventoryLocation, recalculateAggregateInventory } from "~/lib/db/inventory-queries.server";
+import { getProductVariantsBySku, syncStoreLocations } from "~/lib/shopify/inventory.server";
 import { sessionStorage as storage } from "~/shopify.server";
 
 /**
@@ -194,6 +193,8 @@ export async function syncProductCatalog(
   errors: number;
   createdSkus: string[];
   updatedSkus: string[];
+  /** Set when sync could not run (e.g. 401); caller should record FAILED. */
+  errorMessage?: string;
 }> {
   try {
     const store = await prisma.store.findUnique({
@@ -245,36 +246,18 @@ export async function syncProductCatalog(
       accessTokenPrefix: accessToken.substring(0, 8) + "...",
     });
 
-    // Sync store locations before iterating products
-    const locationLookup = new Map<string, string>();
+    // Sync store locations (populates store_locations table for webhook use)
     try {
-      const storeLocations = await syncStoreLocations(
+      await syncStoreLocations(
         { shop: shopDomain, accessToken },
         store.id
       );
-
-      // Build a lookup map: shopifyLocationId -> storeLocation.id
-      for (const loc of storeLocations) {
-        locationLookup.set(loc.shopifyLocationId, loc.id);
-        logger.debug("Added location to lookup", {
-          shopifyLocationId: loc.shopifyLocationId,
-          storeLocationId: loc.id,
-          name: loc.name,
-        });
-      }
-
-      logger.info("Location lookup ready", {
-        shopDomain,
-        locationCount: locationLookup.size,
-        locationIds: Array.from(locationLookup.keys()),
-      });
-    } catch (locErr) {
-      console.error("[syncProductCatalog] LOCATION SYNC FAILED:", locErr);
-      logger.error("Failed to sync store locations, will attempt to create locations on-demand during product sync", locErr, {
+    } catch (locErr: any) {
+      // Non-fatal: locations will be created on-demand when webhooks arrive
+      logger.warn("Failed to sync store locations", {
         shopDomain,
         error: locErr instanceof Error ? locErr.message : String(locErr),
       });
-      // Don't throw - continue sync, locations will be created on-demand if needed
     }
 
     let created = 0;
@@ -327,9 +310,23 @@ export async function syncProductCatalog(
       let response: any;
       try {
         response = await client.query(PRODUCTS_QUERY, variables);
-      } catch (err) {
+      } catch (err: any) {
+        const isAuthError = err?.status === 401 || (err?.message && String(err.message).includes("Access token expired or invalid"));
+        if (isAuthError) {
+          logger.warn("Store token expired or invalid; skipping product sync. Open the app from this store to re-authenticate.", {
+            shopDomain,
+          });
+          return {
+            total: 0,
+            created: 0,
+            updated: 0,
+            errors: 1,
+            createdSkus: [],
+            updatedSkus: [],
+            errorMessage: err?.message ?? "Access token expired or invalid. Open the app from this store in Shopify Admin to re-authenticate.",
+          };
+        }
         logger.error("GraphQL products query failed", err, { shopDomain });
-        // Surface the error instead of silently returning 0 results
         throw new Error(
           `GraphQL query failed for ${shopDomain}: ${err instanceof Error ? err.message : String(err)}`
         );
@@ -399,142 +396,10 @@ export async function syncProductCatalog(
               },
             });
 
+            // Use the aggregate inventoryQuantity from the products query.
+            // Per-location breakdown will be populated by inventory_levels/update webhooks.
+            // This avoids an extra API call per variant which causes Vercel timeouts.
             if (variant.inventoryItem.tracked) {
-              // Fetch per-location inventory with full quantity breakdown
-              try {
-                logger.debug("Fetching inventory levels for tracked item", {
-                  sku: variant.sku,
-                  inventoryItemId: variant.inventoryItem.id,
-                  locationLookupSize: locationLookup.size,
-                });
-                
-                const levels = await getInventoryLevelsWithQuantities(
-                  { shop: shopDomain, accessToken },
-                  variant.inventoryItem.id
-                );
-                
-                logger.info("Retrieved inventory levels", {
-                  sku: variant.sku,
-                  levelCount: levels.length,
-                  locationIds: levels.map((l: any) => l.location.id),
-                });
-
-                if (levels.length === 0) {
-                  logger.debug("No inventory levels found for tracked item", {
-                    sku: variant.sku,
-                    inventoryItemId: variant.inventoryItem.id,
-                  });
-                }
-
-                for (const level of levels) {
-                  const locationGid = level.location.id;
-                  let storeLocationId = locationLookup.get(locationGid);
-
-                  // If location not in lookup, try to get or create it
-                  if (!storeLocationId) {
-                    logger.debug("Location not in lookup, attempting to get or create", {
-                      locationGid,
-                      sku: variant.sku,
-                      locationLookupSize: locationLookup.size,
-                    });
-                    
-                    try {
-                      const { getOrCreateLocation } = await import("~/lib/shopify/inventory.server");
-                      const storeLocation = await getOrCreateLocation(
-                        { shop: shopDomain, accessToken },
-                        store.id,
-                        locationGid
-                      );
-                      const resolvedId = storeLocation?.id;
-                      if (typeof resolvedId !== "string") {
-                        logger.warn("getOrCreateLocation returned no id, skipping level", {
-                          locationGid,
-                          sku: variant.sku,
-                        });
-                        continue;
-                      }
-                      storeLocationId = resolvedId;
-                      // Add to lookup for future iterations
-                      locationLookup.set(locationGid, resolvedId);
-                      logger.info("Created/found location during inventory sync", {
-                        locationGid,
-                        storeLocationId,
-                        sku: variant.sku,
-                      });
-                    } catch (locErr) {
-                      logger.error("Failed to get or create location, skipping inventory level", locErr, {
-                        locationGid,
-                        sku: variant.sku,
-                      });
-                      continue;
-                    }
-                  }
-
-                  if (!storeLocationId) {
-                    logger.warn("Could not resolve store location, skipping inventory level", {
-                      locationGid,
-                      sku: variant.sku,
-                    });
-                    continue;
-                  }
-
-                  const quantities = level.quantities || [];
-                  const available = quantities.find((q: any) => q.name === "available")?.quantity ?? 0;
-                  const committed = quantities.find((q: any) => q.name === "committed")?.quantity ?? 0;
-                  const incoming = quantities.find((q: any) => q.name === "incoming")?.quantity ?? 0;
-
-                  await upsertInventoryLocation(product.id, storeLocationId, {
-                    availableQuantity: available,
-                    committedQuantity: committed,
-                    incomingQuantity: incoming,
-                    lastAdjustedBy: "catalog-sync",
-                  });
-
-                  logger.debug("Upserted inventory location", {
-                    sku: variant.sku,
-                    productId: product.id,
-                    storeLocationId,
-                    available,
-                    committed,
-                    incoming,
-                  });
-                }
-
-                // Recalculate aggregate from all location rows
-                await recalculateAggregateInventory(product.id);
-              } catch (levelErr) {
-                // If per-location fetch fails, fall back to aggregate-only
-                console.error("[syncProductCatalog] INVENTORY LEVELS FETCH FAILED for SKU:", variant.sku, levelErr);
-                logger.warn("Failed to fetch per-location inventory, using aggregate", {
-                  sku: variant.sku,
-                  inventoryItemId: variant.inventoryItem.id,
-                  error: levelErr instanceof Error ? levelErr.message : "Unknown",
-                });
-
-                await prisma.inventory.upsert({
-                  where: { productId: product.id },
-                  create: {
-                    productId: product.id,
-                    availableQuantity: variant.inventoryQuantity || 0,
-                    committedQuantity: 0,
-                    incomingQuantity: 0,
-                    lastAdjustedAt: new Date(),
-                    lastAdjustedBy: "catalog-sync",
-                  },
-                  update: {
-                    availableQuantity: variant.inventoryQuantity || 0,
-                    lastAdjustedAt: new Date(),
-                    lastAdjustedBy: "catalog-sync",
-                  },
-                });
-              }
-            } else if (variant.inventoryItem.tracked) {
-              // Tracked but no inventory levels fetched (shouldn't happen, but fallback)
-              logger.debug("Tracked item but no inventory levels processed, using variant quantity", {
-                sku: variant.sku,
-                inventoryQuantity: variant.inventoryQuantity,
-              });
-              
               await prisma.inventory.upsert({
                 where: { productId: product.id },
                 create: {
@@ -572,7 +437,7 @@ export async function syncProductCatalog(
 
       // Rate limit delay between pages
       if (hasNextPage) {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, 200));
       }
     }
 
