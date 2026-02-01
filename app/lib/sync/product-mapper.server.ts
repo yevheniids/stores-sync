@@ -10,7 +10,8 @@ import { logger } from "~/lib/logger.server";
 import { gidToId } from "~/lib/helpers";
 import type { Product, ProductStoreMapping, Store } from "@prisma/client";
 import type { ProductWithRelations } from "~/types";
-import { getProductVariantsBySku, syncStoreLocations } from "~/lib/shopify/inventory.server";
+import { getProductVariantsBySku, syncStoreLocations, getOrCreateLocation } from "~/lib/shopify/inventory.server";
+import { upsertInventoryLocation, recalculateAggregateInventory } from "~/lib/db/inventory-queries.server";
 import { sessionStorage as storage } from "~/shopify.server";
 
 /**
@@ -247,18 +248,20 @@ export async function syncProductCatalog(
       accessTokenPrefix: accessToken.substring(0, 8) + "...",
     });
 
-    // Sync store locations (populates store_locations table for webhook use)
+    // Sync store locations and build lookup map for per-location inventory
+    const locationLookup = new Map<string, string>();
     try {
-      await syncStoreLocations(
+      const storeLocations = await syncStoreLocations(
         { shop: shopDomain, accessToken },
         store.id
       );
+      for (const loc of storeLocations) {
+        locationLookup.set(loc.shopifyLocationId, loc.id);
+      }
+      console.log(`[SYNC] Locations synced: ${locationLookup.size}`);
     } catch (locErr: any) {
-      // Non-fatal: locations will be created on-demand when webhooks arrive
-      logger.warn("Failed to sync store locations", {
-        shopDomain,
-        error: locErr instanceof Error ? locErr.message : String(locErr),
-      });
+      // Non-fatal: locations will be created on-demand below
+      console.log(`[SYNC] Location sync failed (non-fatal): ${locErr instanceof Error ? locErr.message : locErr}`);
     }
 
     let created = 0;
@@ -291,7 +294,21 @@ export async function syncProductCatalog(
                     price
                     compareAtPrice
                     barcode
-                    inventoryItem { id tracked }
+                    inventoryItem {
+                      id
+                      tracked
+                      inventoryLevels(first: 10) {
+                        edges {
+                          node {
+                            location { id }
+                            quantities(names: ["available", "committed", "incoming"]) {
+                              name
+                              quantity
+                            }
+                          }
+                        }
+                      }
+                    }
                     inventoryPolicy
                     inventoryQuantity
                   }
@@ -402,26 +419,68 @@ export async function syncProductCatalog(
               },
             });
 
-            // Use the aggregate inventoryQuantity from the products query.
-            // Per-location breakdown will be populated by inventory_levels/update webhooks.
-            // This avoids an extra API call per variant which causes Vercel timeouts.
+            // Write per-location inventory from the inline GraphQL data (no extra API calls).
             if (variant.inventoryItem.tracked) {
-              await prisma.inventory.upsert({
-                where: { productId: product.id },
-                create: {
-                  productId: product.id,
-                  availableQuantity: variant.inventoryQuantity || 0,
-                  committedQuantity: 0,
-                  incomingQuantity: 0,
-                  lastAdjustedAt: new Date(),
+              const levels = variant.inventoryItem.inventoryLevels?.edges || [];
+
+              for (const levelEdge of levels) {
+                const level = levelEdge.node;
+                const locationGid = level.location.id;
+                let storeLocationId = locationLookup.get(locationGid);
+
+                if (!storeLocationId) {
+                  try {
+                    const storeLocation = await getOrCreateLocation(
+                      { shop: shopDomain, accessToken },
+                      store.id,
+                      locationGid
+                    );
+                    if (storeLocation?.id) {
+                      storeLocationId = storeLocation.id;
+                      locationLookup.set(locationGid, storeLocation.id);
+                    }
+                  } catch {
+                    // skip this level if location can't be resolved
+                    continue;
+                  }
+                }
+
+                if (!storeLocationId) continue;
+
+                const quantities = level.quantities || [];
+                const available = quantities.find((q: any) => q.name === "available")?.quantity ?? 0;
+                const committed = quantities.find((q: any) => q.name === "committed")?.quantity ?? 0;
+                const incoming = quantities.find((q: any) => q.name === "incoming")?.quantity ?? 0;
+
+                await upsertInventoryLocation(product.id, storeLocationId, {
+                  availableQuantity: available,
+                  committedQuantity: committed,
+                  incomingQuantity: incoming,
                   lastAdjustedBy: "catalog-sync",
-                },
-                update: {
-                  availableQuantity: variant.inventoryQuantity || 0,
-                  lastAdjustedAt: new Date(),
-                  lastAdjustedBy: "catalog-sync",
-                },
-              });
+                });
+              }
+
+              // Recalculate aggregate from location rows, or use inventoryQuantity as fallback
+              if (levels.length > 0) {
+                await recalculateAggregateInventory(product.id);
+              } else {
+                await prisma.inventory.upsert({
+                  where: { productId: product.id },
+                  create: {
+                    productId: product.id,
+                    availableQuantity: variant.inventoryQuantity || 0,
+                    committedQuantity: 0,
+                    incomingQuantity: 0,
+                    lastAdjustedAt: new Date(),
+                    lastAdjustedBy: "catalog-sync",
+                  },
+                  update: {
+                    availableQuantity: variant.inventoryQuantity || 0,
+                    lastAdjustedAt: new Date(),
+                    lastAdjustedBy: "catalog-sync",
+                  },
+                });
+              }
             }
 
             if (existing) {
