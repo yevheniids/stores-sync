@@ -281,12 +281,9 @@ export async function syncProductCatalog(
             node {
               id
               title
-              descriptionHtml
               vendor
               productType
-              tags
-              images(first: 1) { edges { node { url } } }
-              variants(first: 100) {
+              variants(first: 50) {
                 edges {
                   node {
                     id
@@ -297,7 +294,7 @@ export async function syncProductCatalog(
                     inventoryItem {
                       id
                       tracked
-                      inventoryLevels(first: 10) {
+                      inventoryLevels(first: 5) {
                         edges {
                           node {
                             location { id }
@@ -322,7 +319,7 @@ export async function syncProductCatalog(
     `;
 
     while (hasNextPage) {
-      const variables: Record<string, unknown> = { first: 50 };
+      const variables: Record<string, unknown> = { first: 25 };
       if (cursor) variables.after = cursor;
 
       let response: any;
@@ -371,21 +368,15 @@ export async function syncProductCatalog(
               create: {
                 sku: variant.sku,
                 title: shopifyProduct.title,
-                description: shopifyProduct.descriptionHtml || undefined,
                 vendor: shopifyProduct.vendor || undefined,
                 productType: shopifyProduct.productType || undefined,
-                tags: shopifyProduct.tags || [],
-                imageUrl: shopifyProduct.images?.edges?.[0]?.node?.url || undefined,
                 inventoryPolicy: variant.inventoryPolicy === "CONTINUE" ? "CONTINUE" : "DENY",
                 tracksInventory: variant.inventoryItem.tracked,
               },
               update: {
                 title: shopifyProduct.title,
-                description: shopifyProduct.descriptionHtml || undefined,
                 vendor: shopifyProduct.vendor || undefined,
                 productType: shopifyProduct.productType || undefined,
-                tags: shopifyProduct.tags || [],
-                imageUrl: shopifyProduct.images?.edges?.[0]?.node?.url || undefined,
               },
             });
 
