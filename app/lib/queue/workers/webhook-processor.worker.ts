@@ -389,7 +389,7 @@ async function processInventoryUpdateForMapping(
   const newAvailable = inventoryLevel.available;
 
   if (session) {
-    // Resolve location → absolute mode (per-location + recalculate)
+    // Resolve location name from DB → absolute mode (per-location + recalculate)
     const storeLocation = await getOrCreateLocation(
       { shop: session.shop, accessToken: session.accessToken },
       store.id,
@@ -402,7 +402,7 @@ async function processInventoryUpdateForMapping(
       adjustedBy: `webhook-${shopDomain}`,
       absolute: {
         availableQuantity: newAvailable,
-        storeLocationId: storeLocation.id,
+        locationName: storeLocation.name,
       },
     });
 

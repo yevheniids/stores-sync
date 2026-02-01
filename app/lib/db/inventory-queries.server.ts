@@ -548,10 +548,14 @@ export async function recalculateAggregateInventory(
 /**
  * Unified inventory update — single entry point for all 6 write paths.
  *
+ * Lookups are always by SKU + locationName (not location IDs).
+ * The DB is the source of truth — StoreLocation.name identifies a physical location.
+ *
  * Modes:
- *   absolute   – catalog sync / inventory webhook (location known): upsert location row, recalculate aggregate
- *   delta      – order create/cancel/refund: arithmetic on current aggregate (atomic)
- *   setAggregate – product webhook / fallback when no location data: direct upsert of aggregate
+ *   absolute      – catalog sync / inventory webhook: set exact value at a named location, recalculate aggregate
+ *   delta         – order create/cancel/refund: arithmetic on matching location rows by name, recalculate aggregate
+ *                   (falls back to aggregate-only if locationName not provided)
+ *   setAggregate  – product webhook / fallback when no location data: direct upsert of aggregate
  */
 export async function unifiedInventoryUpdate(params: {
   sku: string;
@@ -562,13 +566,13 @@ export async function unifiedInventoryUpdate(params: {
     availableQuantity: number;
     committedQuantity?: number;
     incomingQuantity?: number;
-    storeLocationId: string;
+    locationName: string;
     skipRecalculation?: boolean;
   };
   delta?: {
     availableQuantityChange: number;
     committedQuantityChange?: number;
-    storeLocationId?: string;
+    locationName?: string;
   };
   setAggregate?: {
     availableQuantity: number;
@@ -611,15 +615,29 @@ export async function unifiedInventoryUpdate(params: {
     incoming: existing.incomingQuantity,
   };
 
-  // --- MODE A: absolute (per-location → recalculate) ---
+  // --- MODE A: absolute (set exact value at every location matching name → recalculate) ---
   if (params.absolute) {
     const a = params.absolute;
-    await upsertInventoryLocation(productId, a.storeLocationId, {
-      availableQuantity: a.availableQuantity,
-      committedQuantity: a.committedQuantity,
-      incomingQuantity: a.incomingQuantity,
-      lastAdjustedBy: adjustedBy,
+
+    // Find all StoreLocation records with this name (across all stores)
+    const matchingLocations = await prisma.storeLocation.findMany({
+      where: { name: a.locationName },
     });
+
+    if (matchingLocations.length === 0) {
+      logger.warn("No StoreLocation found for locationName, skipping per-location write", {
+        sku, locationName: a.locationName,
+      });
+    }
+
+    for (const loc of matchingLocations) {
+      await upsertInventoryLocation(productId, loc.id, {
+        availableQuantity: a.availableQuantity,
+        committedQuantity: a.committedQuantity,
+        incomingQuantity: a.incomingQuantity,
+        lastAdjustedBy: adjustedBy,
+      });
+    }
 
     let updated = existing;
     if (!a.skipRecalculation) {
@@ -638,9 +656,55 @@ export async function unifiedInventoryUpdate(params: {
     };
   }
 
-  // --- MODE B: delta (atomic increment/decrement) ---
+  // --- MODE B: delta (find location rows by name, apply delta, recalculate) ---
   if (params.delta) {
     const d = params.delta;
+
+    if (d.locationName) {
+      // Find all InventoryLocation rows for this product where StoreLocation.name matches
+      const locationRows = await prisma.inventoryLocation.findMany({
+        where: {
+          productId,
+          storeLocation: { name: d.locationName },
+        },
+      });
+
+      if (locationRows.length > 0) {
+        // Apply delta to each matching location row
+        for (const row of locationRows) {
+          await prisma.inventoryLocation.update({
+            where: { id: row.id },
+            data: {
+              availableQuantity: Math.max(0, row.availableQuantity + d.availableQuantityChange),
+              committedQuantity: Math.max(0, row.committedQuantity + (d.committedQuantityChange ?? 0)),
+              lastAdjustedAt: new Date(),
+              lastAdjustedBy: adjustedBy,
+            },
+          });
+        }
+
+        // Recalculate aggregate from all location rows
+        const updated = await recalculateAggregateInventory(productId);
+
+        return {
+          productId,
+          previousAggregate,
+          newAggregate: {
+            available: updated.availableQuantity,
+            committed: updated.committedQuantity,
+            incoming: updated.incomingQuantity,
+          },
+          mode: "delta",
+        };
+      }
+
+      // No location rows found for this name — fall through to aggregate fallback
+      logger.warn("No InventoryLocation rows found for delta locationName, falling back to aggregate", {
+        sku, locationName: d.locationName, productId,
+      });
+    }
+
+    // Fallback: direct arithmetic on aggregate (no location info available)
     const updated = await executeTransaction(async (tx) => {
       const current = await tx.inventory.findUniqueOrThrow({ where: { productId } });
 

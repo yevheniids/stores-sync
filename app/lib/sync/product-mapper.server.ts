@@ -248,17 +248,17 @@ export async function syncProductCatalog(
       accessTokenPrefix: accessToken.substring(0, 8) + "...",
     });
 
-    // Sync store locations and build lookup map for per-location inventory
-    const locationLookup = new Map<string, string>();
+    // Sync store locations and build lookup map: shopifyLocationGid → locationName
+    const locationNameLookup = new Map<string, string>();
     try {
       const storeLocations = await syncStoreLocations(
         { shop: shopDomain, accessToken },
         store.id
       );
       for (const loc of storeLocations) {
-        locationLookup.set(loc.shopifyLocationId, loc.id);
+        locationNameLookup.set(loc.shopifyLocationId, loc.name);
       }
-      console.log(`[SYNC] Locations synced: ${locationLookup.size}`);
+      console.log(`[SYNC] Locations synced: ${locationNameLookup.size}`);
     } catch (locErr: any) {
       // Non-fatal: locations will be created on-demand below
       console.log(`[SYNC] Location sync failed (non-fatal): ${locErr instanceof Error ? locErr.message : locErr}`);
@@ -417,18 +417,19 @@ export async function syncProductCatalog(
               for (const levelEdge of levels) {
                 const level = levelEdge.node;
                 const locationGid = level.location.id;
-                let storeLocationId = locationLookup.get(locationGid);
+                let locationName = locationNameLookup.get(locationGid);
 
-                if (!storeLocationId) {
+                // Resolve location name from DB if not in cache
+                if (!locationName) {
                   try {
                     const storeLocation = await getOrCreateLocation(
                       { shop: shopDomain, accessToken },
                       store.id,
                       locationGid
                     );
-                    if (storeLocation?.id) {
-                      storeLocationId = storeLocation.id;
-                      locationLookup.set(locationGid, storeLocation.id);
+                    if (storeLocation?.name) {
+                      locationName = storeLocation.name;
+                      locationNameLookup.set(locationGid, storeLocation.name);
                     }
                   } catch {
                     // skip this level if location can't be resolved
@@ -436,7 +437,7 @@ export async function syncProductCatalog(
                   }
                 }
 
-                if (!storeLocationId) continue;
+                if (!locationName) continue;
 
                 const quantities = level.quantities || [];
                 const available = quantities.find((q: any) => q.name === "available")?.quantity ?? 0;
@@ -451,7 +452,7 @@ export async function syncProductCatalog(
                     availableQuantity: available,
                     committedQuantity: committed,
                     incomingQuantity: incoming,
-                    storeLocationId,
+                    locationName,
                     skipRecalculation: true, // batch: recalculate once after loop
                   },
                 });
