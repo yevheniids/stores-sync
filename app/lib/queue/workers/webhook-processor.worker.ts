@@ -440,6 +440,15 @@ async function processInventoryUpdateForMapping(
       previousValue: result.previousAggregate.available,
       newValue: result.newAggregate.available,
     });
+
+    // Propagate to other stores
+    await propagateInventoryToOtherStores({
+      productId: mapping.productId,
+      sku: mapping.product.sku,
+      sourceStoreId: store.id,
+      newAvailableQuantity: result.newAggregate.available,
+      eventId,
+    });
   } else {
     // No session — setAggregate fallback
     logger.warn("No session for store, falling back to setAggregate update", {
@@ -478,6 +487,15 @@ async function processInventoryUpdateForMapping(
       locationId: inventoryLevel.location_id,
       previousValue: result.previousAggregate.available,
       newValue: result.newAggregate.available,
+    });
+
+    // Propagate to other stores
+    await propagateInventoryToOtherStores({
+      productId: mapping.productId,
+      sku: mapping.product.sku,
+      sourceStoreId: store.id,
+      newAvailableQuantity: result.newAggregate.available,
+      eventId,
     });
   }
 }
@@ -634,12 +652,16 @@ async function decreaseInventoryForLineItem(
     }
   }
 
+  // Only update committed quantity here.
+  // The available quantity change is handled by the inventory_levels/update webhook
+  // which carries the absolute value from Shopify and propagates to other stores.
+  // This prevents double-counting when both webhooks fire for the same order.
   const result = await unifiedInventoryUpdate({
     sku,
     productId: product.id,
     adjustedBy: `webhook-${reference}`,
     delta: {
-      availableQuantityChange: -quantity,
+      availableQuantityChange: 0,
       committedQuantityChange: quantity,
     },
   });
@@ -655,11 +677,9 @@ async function decreaseInventoryForLineItem(
       startedAt: new Date(),
       completedAt: new Date(),
       previousValue: {
-        available: result.previousAggregate.available,
         committed: result.previousAggregate.committed,
       },
       newValue: {
-        available: result.newAggregate.available,
         committed: result.newAggregate.committed,
       },
       triggeredBy: `webhook-${eventId}`,
@@ -667,15 +687,6 @@ async function decreaseInventoryForLineItem(
   });
 
   logger.sync("INVENTORY_UPDATE", product.id, storeId, "completed");
-
-  // Propagate the updated quantity to all other stores
-  await propagateInventoryToOtherStores({
-    productId: product.id,
-    sku,
-    sourceStoreId: storeId,
-    newAvailableQuantity: result.newAggregate.available,
-    eventId,
-  });
 }
 
 /**
@@ -712,12 +723,15 @@ async function increaseInventoryForLineItem(
     }
   }
 
+  // Only update committed quantity here.
+  // The available quantity change is handled by the inventory_levels/update webhook
+  // which carries the absolute value from Shopify and propagates to other stores.
   const result = await unifiedInventoryUpdate({
     sku,
     productId: product.id,
     adjustedBy: `webhook-${reference}`,
     delta: {
-      availableQuantityChange: quantity,
+      availableQuantityChange: 0,
       committedQuantityChange: -quantity,
     },
   });
@@ -733,11 +747,9 @@ async function increaseInventoryForLineItem(
       startedAt: new Date(),
       completedAt: new Date(),
       previousValue: {
-        available: result.previousAggregate.available,
         committed: result.previousAggregate.committed,
       },
       newValue: {
-        available: result.newAggregate.available,
         committed: result.newAggregate.committed,
       },
       triggeredBy: `webhook-${eventId}`,
@@ -745,15 +757,6 @@ async function increaseInventoryForLineItem(
   });
 
   logger.sync("INVENTORY_UPDATE", product.id, storeId, "completed");
-
-  // Propagate the updated quantity to all other stores
-  await propagateInventoryToOtherStores({
-    productId: product.id,
-    sku,
-    sourceStoreId: storeId,
-    newAvailableQuantity: result.newAggregate.available,
-    eventId,
-  });
 }
 
 /**
