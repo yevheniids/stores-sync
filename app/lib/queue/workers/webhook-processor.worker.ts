@@ -441,12 +441,13 @@ async function processInventoryUpdateForMapping(
       newValue: result.newAggregate.available,
     });
 
-    // Propagate to other stores
+    // Propagate to other stores — push the per-location value, not the aggregate
     await propagateInventoryToOtherStores({
       productId: mapping.productId,
       sku: mapping.product.sku,
       sourceStoreId: store.id,
-      newAvailableQuantity: result.newAggregate.available,
+      locationName: storeLocation.name,
+      newAvailableQuantity: newAvailable,
       eventId,
     });
   } else {
@@ -489,29 +490,27 @@ async function processInventoryUpdateForMapping(
       newValue: result.newAggregate.available,
     });
 
-    // Propagate to other stores
-    await propagateInventoryToOtherStores({
+    // Cannot propagate without location name — no session to resolve location
+    logger.warn("Skipping propagation: no session to resolve location name", {
+      shopDomain,
       productId: mapping.productId,
-      sku: mapping.product.sku,
-      sourceStoreId: store.id,
-      newAvailableQuantity: result.newAggregate.available,
-      eventId,
     });
   }
 }
 
 /**
  * Propagate inventory change to all other stores (except the source).
- * Reads the current central aggregate and pushes it to every mapped store.
+ * Pushes the per-location value to the matching location (by name) on each target store.
  */
 async function propagateInventoryToOtherStores(params: {
   productId: string;
   sku: string;
   sourceStoreId: string;
+  locationName: string;
   newAvailableQuantity: number;
   eventId: string;
 }): Promise<void> {
-  const { productId, sku, sourceStoreId, newAvailableQuantity, eventId } = params;
+  const { productId, sku, sourceStoreId, locationName, newAvailableQuantity, eventId } = params;
 
   // Get all store mappings for this product
   const allMappings = await getAllMappingsForProduct(productId);
@@ -527,6 +526,7 @@ async function propagateInventoryToOtherStores(params: {
   logger.info("Propagating inventory to other stores", {
     sku,
     productId,
+    locationName,
     targetStoreCount: targetMappings.length,
     newAvailableQuantity,
   });
@@ -561,24 +561,30 @@ async function propagateInventoryToOtherStores(params: {
         continue;
       }
 
-      // Get primary location for the target store
-      const location = await getPrimaryLocation(
-        { shop: targetShop, accessToken: targetAccessToken },
-        mapping.storeId
-      );
+      // Find the target store's location with the same name
+      const targetLocation = await prisma.storeLocation.findFirst({
+        where: {
+          storeId: mapping.storeId,
+          name: locationName,
+          isActive: true,
+        },
+      });
 
-      if (!location) {
-        logger.warn("No location found for target store, skipping", { shopDomain: targetShop });
+      if (!targetLocation) {
+        logger.warn("No matching location found on target store, skipping", {
+          shopDomain: targetShop,
+          locationName,
+        });
         continue;
       }
 
-      // Push inventory to Shopify
+      // Push inventory to Shopify at the matching location
       await updateInventoryLevel(
         { shop: targetShop, accessToken: targetAccessToken },
         mapping.shopifyInventoryItemId,
-        location.id,
+        targetLocation.shopifyLocationId,
         newAvailableQuantity,
-        `Synced from order event: ${eventId}`
+        `Synced inventory for location ${locationName}`
       );
 
       // Record CENTRAL_TO_STORE sync operation
@@ -588,19 +594,21 @@ async function propagateInventoryToOtherStores(params: {
         productId,
         storeId: mapping.storeId,
         status: "COMPLETED",
-        newValue: { available: newAvailableQuantity },
+        newValue: { available: newAvailableQuantity, location: locationName },
         triggeredBy: `webhook-${eventId}`,
       });
 
       logger.info("Inventory propagated to store", {
         sku,
         targetShop,
+        locationName,
         newAvailableQuantity,
       });
     } catch (error) {
       logger.error("Failed to propagate inventory to store", error, {
         sku,
         targetShop: mapping.store.shopDomain,
+        locationName,
         productId,
       });
 
