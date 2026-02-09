@@ -364,9 +364,9 @@ async function processInventoryUpdateForMapping(
   inventoryLevel: { inventory_item_id: number; location_id: number; available: number }
 ): Promise<void> {
   // Check if this update was caused by our own outbound sync to avoid loops.
-  // Only skip if WE recently pushed inventory TO this store (CENTRAL_TO_STORE),
-  // which would cause Shopify to echo it back as a webhook.
-  // Duplicate webhooks for the same event are already handled by idempotency (eventId).
+  // We compare BOTH time (within 15 seconds) AND value (same quantity we pushed).
+  // A pure time-based check causes false positives when a new order on the same store
+  // arrives shortly after we pushed inventory to it.
   const recentOutboundSync = await prisma.syncOperation.findFirst({
     where: {
       productId: mapping.productId,
@@ -375,7 +375,7 @@ async function processInventoryUpdateForMapping(
       direction: "CENTRAL_TO_STORE",
       status: "COMPLETED",
       completedAt: {
-        gte: new Date(Date.now() - 60000), // Within last minute
+        gte: new Date(Date.now() - 15000), // Within last 15 seconds
       },
     },
     orderBy: {
@@ -384,12 +384,25 @@ async function processInventoryUpdateForMapping(
   });
 
   if (recentOutboundSync) {
-    logger.info("Skipping inventory update - echo from our own outbound sync", {
+    // Compare the value we pushed with the incoming webhook value.
+    // If they match, this is an echo. If different, it's a genuine new change.
+    const pushedAvailable = (recentOutboundSync.newValue as any)?.available;
+    if (pushedAvailable === inventoryLevel.available) {
+      logger.info("Skipping inventory update - echo from our own outbound sync (same value)", {
+        eventId,
+        productId: mapping.productId,
+        syncOpId: recentOutboundSync.id,
+        pushedValue: pushedAvailable,
+        webhookValue: inventoryLevel.available,
+      });
+      return;
+    }
+    logger.info("Processing inventory update despite recent outbound sync - value differs (new change)", {
       eventId,
       productId: mapping.productId,
-      syncOpId: recentOutboundSync.id,
+      pushedValue: pushedAvailable,
+      webhookValue: inventoryLevel.available,
     });
-    return;
   }
 
   // Resolve the location from the webhook's numeric location_id
