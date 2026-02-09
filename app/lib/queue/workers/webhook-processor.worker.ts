@@ -19,9 +19,15 @@ import type {
   InventoryUpdateJobData,
 } from "~/lib/queue/jobs.server";
 import { gidToId, idToGid } from "~/lib/helpers";
-import { getOrCreateLocation } from "~/lib/shopify/inventory.server";
+import {
+  getOrCreateLocation,
+  updateInventoryLevel,
+  getPrimaryLocation,
+} from "~/lib/shopify/inventory.server";
 import {
   unifiedInventoryUpdate,
+  recordSyncOperation,
+  getAllMappingsForProduct,
 } from "~/lib/db/inventory-queries.server";
 import { sessionStorage as storage } from "~/shopify.server";
 
@@ -477,6 +483,124 @@ async function processInventoryUpdateForMapping(
 }
 
 /**
+ * Propagate inventory change to all other stores (except the source).
+ * Reads the current central aggregate and pushes it to every mapped store.
+ */
+async function propagateInventoryToOtherStores(params: {
+  productId: string;
+  sku: string;
+  sourceStoreId: string;
+  newAvailableQuantity: number;
+  eventId: string;
+}): Promise<void> {
+  const { productId, sku, sourceStoreId, newAvailableQuantity, eventId } = params;
+
+  // Get all store mappings for this product
+  const allMappings = await getAllMappingsForProduct(productId);
+  const targetMappings = allMappings.filter(
+    (m) => m.storeId !== sourceStoreId && m.store.isActive && m.store.syncEnabled
+  );
+
+  if (targetMappings.length === 0) {
+    logger.debug("No target stores to propagate inventory to", { sku, productId });
+    return;
+  }
+
+  logger.info("Propagating inventory to other stores", {
+    sku,
+    productId,
+    targetStoreCount: targetMappings.length,
+    newAvailableQuantity,
+  });
+
+  for (const mapping of targetMappings) {
+    try {
+      const targetShop = mapping.store.shopDomain;
+
+      // Resolve access token: offline session > Store.accessToken
+      let targetAccessToken: string | undefined;
+      const offlineSession = await storage.loadSession(`offline_${targetShop}`);
+      if (offlineSession?.accessToken) {
+        targetAccessToken = offlineSession.accessToken;
+      } else {
+        const storeForToken = await prisma.store.findUnique({
+          where: { shopDomain: targetShop },
+          select: { accessToken: true },
+        });
+        targetAccessToken = storeForToken?.accessToken || undefined;
+      }
+
+      if (!targetAccessToken) {
+        logger.warn("No access token for target store, skipping", { shopDomain: targetShop });
+        continue;
+      }
+
+      if (!mapping.shopifyInventoryItemId) {
+        logger.warn("No inventory item ID for mapping, skipping", {
+          shopDomain: targetShop,
+          productId,
+        });
+        continue;
+      }
+
+      // Get primary location for the target store
+      const location = await getPrimaryLocation(
+        { shop: targetShop, accessToken: targetAccessToken },
+        mapping.storeId
+      );
+
+      if (!location) {
+        logger.warn("No location found for target store, skipping", { shopDomain: targetShop });
+        continue;
+      }
+
+      // Push inventory to Shopify
+      await updateInventoryLevel(
+        { shop: targetShop, accessToken: targetAccessToken },
+        mapping.shopifyInventoryItemId,
+        location.id,
+        newAvailableQuantity,
+        `Synced from order event: ${eventId}`
+      );
+
+      // Record CENTRAL_TO_STORE sync operation
+      await recordSyncOperation({
+        operationType: "INVENTORY_UPDATE",
+        direction: "CENTRAL_TO_STORE",
+        productId,
+        storeId: mapping.storeId,
+        status: "COMPLETED",
+        newValue: { available: newAvailableQuantity },
+        triggeredBy: `webhook-${eventId}`,
+      });
+
+      logger.info("Inventory propagated to store", {
+        sku,
+        targetShop,
+        newAvailableQuantity,
+      });
+    } catch (error) {
+      logger.error("Failed to propagate inventory to store", error, {
+        sku,
+        targetShop: mapping.store.shopDomain,
+        productId,
+      });
+
+      // Record failed sync but continue with other stores
+      await recordSyncOperation({
+        operationType: "INVENTORY_UPDATE",
+        direction: "CENTRAL_TO_STORE",
+        productId,
+        storeId: mapping.storeId,
+        status: "FAILED",
+        errorMessage: error instanceof Error ? error.message : "Unknown error",
+        triggeredBy: `webhook-${eventId}`,
+      });
+    }
+  }
+}
+
+/**
  * Decrease inventory for a line item (order created)
  */
 async function decreaseInventoryForLineItem(
@@ -543,6 +667,15 @@ async function decreaseInventoryForLineItem(
   });
 
   logger.sync("INVENTORY_UPDATE", product.id, storeId, "completed");
+
+  // Propagate the updated quantity to all other stores
+  await propagateInventoryToOtherStores({
+    productId: product.id,
+    sku,
+    sourceStoreId: storeId,
+    newAvailableQuantity: result.newAggregate.available,
+    eventId,
+  });
 }
 
 /**
@@ -612,6 +745,15 @@ async function increaseInventoryForLineItem(
   });
 
   logger.sync("INVENTORY_UPDATE", product.id, storeId, "completed");
+
+  // Propagate the updated quantity to all other stores
+  await propagateInventoryToOtherStores({
+    productId: product.id,
+    sku,
+    sourceStoreId: storeId,
+    newAvailableQuantity: result.newAggregate.available,
+    eventId,
+  });
 }
 
 /**
