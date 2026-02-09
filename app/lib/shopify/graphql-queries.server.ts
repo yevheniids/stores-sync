@@ -365,6 +365,7 @@ export interface Location {
 export interface InventorySetQuantitiesInput {
   reason: string;
   name: string;
+  ignoreCompareQuantity?: boolean;
   quantities: Array<{
     inventoryItemId: string;
     locationId: string;

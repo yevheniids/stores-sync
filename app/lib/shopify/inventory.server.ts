@@ -498,8 +498,9 @@ export async function updateInventoryLevel(
   reason: string
 ): Promise<void> {
   const input: InventorySetQuantitiesInput = {
-    reason,
-    name: `Sync from central inventory`,
+    reason: "correction",
+    name: "available",
+    ignoreCompareQuantity: true,
     quantities: [
       {
         inventoryItemId,
@@ -535,8 +536,9 @@ export async function batchUpdateInventory(
     const batch = updates.slice(i, i + BATCH_SIZE);
 
     const input: InventorySetQuantitiesInput = {
-      reason,
-      name: `Batch sync from central inventory`,
+      reason: "correction",
+      name: "available",
+      ignoreCompareQuantity: true,
       quantities: batch,
     };
 
